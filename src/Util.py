@@ -209,6 +209,73 @@ def _gb_request(url, params=None, referer=None, timeout=10):
     return resp
 
 
+def _unknown_property(data):
+    """Returns the property GameBanana rejected, or None if that isn't the problem."""
+    if not isinstance(data, dict):
+        return None
+    error = data.get('_aErrorData', {}).get('_csvProperties', {})
+    if not isinstance(error, dict) or error.get('_sErrorCode') != 'UNKNOWN_PROPERTY':
+        return None
+    # The message reads: `_sVersion` not recognized
+    match = re.search(r'`([^`]+)`', error.get('_sErrorMessage', ''))
+    return match.group(1) if match else None
+
+
+# Everything the download flow needs from a submission. Not every model has
+# every one of these; gb_item_request drops the ones a model rejects.
+GB_ITEM_PROPERTIES = [
+    '_sName', '_sVersion', '_aFiles', '_sDescription', '_sText',
+    '_aPreviewMedia', '_aSubmitter', '_sProfileUrl', '_idRow', '_sModelName',
+]
+
+
+def gb_item_request(api_item_type, item_id, properties, referer=None):
+    """Fetches one submission, dropping the fields its model does not have.
+
+    Submission types do not all carry the same fields - Sound has no _sVersion -
+    and GameBanana rejects the whole request over a single unknown name. Asking
+    for one extra field would then break every download of that type, so drop
+    whatever it names and ask again.
+
+    The rejection cannot be spotted from the status code: the same request
+    answers 400 on its own but 200 when sent with a Referer, error body and all.
+    So the body is what gets inspected, either way.
+
+    Returns the parsed item data.
+    """
+    props = list(properties)
+    while True:
+        url = f"https://gamebanana.com/apiv11/{api_item_type}/{item_id}"
+        try:
+            data = _gb_request(url, params={'_csvProperties': ','.join(props)},
+                               referer=referer).json()
+        except requests.HTTPError as e:
+            if e.response is None:
+                raise
+            try:
+                data = e.response.json()
+            except ValueError:
+                raise e
+
+        unknown = _unknown_property(data)
+        if unknown is None:
+            if isinstance(data, dict) and data.get('_sErrorCode'):
+                raise ValueError(
+                    f"GameBanana rejected the request for {api_item_type}/{item_id}: "
+                    f"{data.get('_sErrorCode')}")
+            return data
+
+        if unknown not in props:
+            raise ValueError(
+                f"GameBanana rejected '{unknown}' for {api_item_type}/{item_id}, "
+                "which was never requested.")
+        print(f"[DEBUG] {api_item_type} has no {unknown}; retrying without it")
+        props.remove(unknown)
+        if not props:
+            raise ValueError(
+                f"GameBanana rejected every property requested for {api_item_type}/{item_id}.")
+
+
 def get_gb_item_name(item_type, item_id):
     """Fetches an item's name from the GameBanana API using its type and ID."""
     if not item_type or not item_id:
@@ -246,12 +313,10 @@ def get_gb_item_data_from_url(url):
         raise ValueError("Could not extract a valid item type and ID from the URL.")
 
     api_item_type = item_type.rstrip('s').capitalize()
-    api_url = f"https://gamebanana.com/apiv11/{api_item_type}/{item_id}?_csvProperties=_sName,_sVersion,_aFiles,_sDescription,_sText,_aPreviewMedia,_aSubmitter,_sProfileUrl,_idRow,_sModelName"
-    
+
     try:
         # Use the page URL as the Referer to more closely emulate a browser
-        resp = _gb_request(api_url, referer=url)
-        return resp.json()
+        return gb_item_request(api_item_type, item_id, GB_ITEM_PROPERTIES, referer=url)
     except requests.RequestException as e:
         raise ConnectionError(f"Could not connect to GameBanana API: {e}")
     except json.JSONDecodeError as e:
@@ -267,11 +332,9 @@ def get_gb_item_data_by_id(item_type, item_id):
 
     # API expects singular, capitalized type (e.g., "Mod", "Sound")
     api_item_type = item_type.rstrip('s').capitalize()
-    api_url = f"https://gamebanana.com/apiv11/{api_item_type}/{item_id}?_csvProperties=_sName,_sVersion,_aFiles,_sDescription,_sText,_aPreviewMedia,_aSubmitter,_sProfileUrl,_idRow,_sModelName"
-    
+
     try:
-        resp = _gb_request(api_url)
-        return resp.json()
+        return gb_item_request(api_item_type, item_id, GB_ITEM_PROPERTIES)
     except requests.RequestException as e:
         raise ConnectionError(f"Could not connect to GameBanana API: {e}")
     except json.JSONDecodeError as e:
@@ -309,11 +372,9 @@ def get_gb_mod_version_and_author(mod_page_url):
         raise ValueError("Could not extract valid item details from the URL.")
 
     api_item_type = item_type.rstrip('s').capitalize()
-    api_url = f"https://gamebanana.com/apiv11/{api_item_type}/{item_id}?_csvProperties=_sVersion,_aSubmitter"
 
     try:
-        resp = _gb_request(api_url)
-        item_data = resp.json()
+        item_data = gb_item_request(api_item_type, item_id, ['_sVersion', '_aSubmitter'])
         submitter = item_data.get("_aSubmitter") or {}
         return item_data.get("_sVersion"), submitter.get("_sName")
     except requests.RequestException as e:

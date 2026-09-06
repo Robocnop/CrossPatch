@@ -243,10 +243,11 @@ class DownloadManager:
             self._ensure_mods_folder()
 
             api_item_type = item_type.capitalize()
-            api_url = f"https://gamebanana.com/apiv11/{api_item_type}/{item_id}?_csvProperties=_sName,_sVersion,_aFiles,_aSubmitter"
-            response = requests.get(api_url, headers={'User-Agent': BROWSER_USER_AGENT}, timeout=15)
-            response.raise_for_status()
-            item_data = response.json()
+            # Via the shared helper: a Sound submission has no _sVersion, and
+            # asking for it would fail the whole request.
+            item_data = Util.gb_item_request(
+                api_item_type, item_id,
+                ['_sName', '_sVersion', '_aFiles', '_aSubmitter', '_sProfileUrl'])
             item_name = safe_name(item_data.get('_sName', f"mod_{item_id}").replace(" ", ""), f"mod_{item_id}")
             file_name = safe_name(f"{item_name}_download.{file_ext or 'zip'}", "download.zip")
 
