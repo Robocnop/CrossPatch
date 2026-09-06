@@ -1,5 +1,5 @@
 APP_TITLE = "CrossPatch - A Crossworlds Mod Manager"
-APP_VERSION = "1.2.2"
+APP_VERSION = "1.2.3"
 CONFIG_FILE = "mod_manager_config.json"
 # This fork is maintained separately, so the updater follows its own
 # releases. Pointing it at the original repository would let an upstream

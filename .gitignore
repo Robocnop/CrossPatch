@@ -190,3 +190,6 @@ mods/
 
 # Code signing tooling, kept local for now
 signing/
+
+# Local notes for Claude Code, not part of the project
+CLAUDE.md

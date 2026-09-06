@@ -2,6 +2,7 @@ import os
 import json
 import requests
 import shutil
+import tempfile
 import subprocess
 import zipfile
 import urllib.request
@@ -1483,10 +1484,15 @@ def extract_archive(archive_path, dest_path, progress_signal=None, clean_destina
     items = os.listdir(dest_path)
     if len(items) == 1 and os.path.isdir(os.path.join(dest_path, items[0])):
         print("Single nested folder detected. Correcting structure...")
-        nested_folder_path = os.path.join(dest_path, items[0])
+        # The nested folder is moved aside first: it may itself contain an entry
+        # with the same name (the Linux release zip is CrossPatch/CrossPatch),
+        # and moving that up while the folder is still there collides with it.
+        staging = tempfile.mkdtemp(dir=os.path.dirname(os.path.abspath(dest_path)))
+        nested_folder_path = shutil.move(os.path.join(dest_path, items[0]), staging)
         for item_name in os.listdir(nested_folder_path):
             shutil.move(os.path.join(nested_folder_path, item_name), dest_path)
         os.rmdir(nested_folder_path)
+        os.rmdir(staging)
         print(f"Corrected nested folder structure for '{os.path.basename(dest_path)}'.")
     
     if finished_signal:
