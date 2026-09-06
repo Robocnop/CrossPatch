@@ -639,6 +639,11 @@ def is_newer_version(local, remote):
     return rv > lv
 
 def check_for_updates_pyside(parent_window):
+    if not is_packaged():
+        # Running from source: the updater would overwrite src/ with a release build.
+        print("Skipping update check (running from source).")
+        return
+
     print("Checking for updates...")
     remote_info = fetch_remote_version()
     if not remote_info:

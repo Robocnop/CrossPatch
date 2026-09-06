@@ -2,7 +2,9 @@ import os
 import sys
 import platform
 import shutil
+import shlex
 import subprocess
+import tempfile
 import threading
 import time
 import requests
@@ -142,25 +144,55 @@ class Updater:
     def _run_updater_script(self, source_path):
         app_path = os.path.dirname(sys.executable) if is_packaged() else os.path.dirname(os.path.abspath(__file__))
         app_executable = os.path.basename(sys.executable)
+        app_exe_path = os.path.join(app_path, app_executable)
         pid = os.getpid()
 
+        # The script lives outside update_temp so it can delete that folder while
+        # still running, and so it survives if the app directory is read-only.
+        script_dir = tempfile.mkdtemp(prefix='crosspatch-update-')
+
         if platform.system() == "Windows":
-            script_path = os.path.join(self.temp_dir, 'updater.bat')
+            script_path = os.path.join(script_dir, 'updater.bat')
             # Ensure all paths are double-quoted to handle spaces correctly.
-            quoted_source_path = f'"{source_path}"'
-            quoted_app_path = f'"{app_path}"'
-            quoted_temp_dir = f'"{self.temp_dir}"'
-            script_content = f"""
-@echo off & title CrossPatch Updater
+            script_content = f"""@echo off
+title CrossPatch Updater
 echo Waiting for CrossPatch (PID: {pid}) to close...
-taskkill /F /PID {pid} > nul 2>&1
-timeout /t 1 /nobreak > nul
+set /a WAITED=0
+:waitloop
+tasklist /fi "PID eq {pid}" /nh 2>nul | find "{pid}" >nul
+if errorlevel 1 goto closed
+set /a WAITED+=1
+if %WAITED% geq 15 goto forcekill
+timeout /t 1 /nobreak >nul
+goto waitloop
+
+:forcekill
+echo CrossPatch did not exit on its own, closing it now...
+taskkill /f /pid {pid} >nul 2>&1
+timeout /t 2 /nobreak >nul
+
+:closed
 echo.
-echo Updating files from {quoted_source_path} to {quoted_app_path}...
-xcopy {quoted_source_path} {quoted_app_path} /E /Y /I /Q
+echo Updating files in "{app_path}"...
+xcopy "{source_path}" "{app_path}" /E /Y /I /Q
+if errorlevel 1 goto failed
+
+echo Cleaning up...
+rmdir /s /q "{self.temp_dir}"
+
+echo Update successful! Restarting CrossPatch...
+start "" "{app_exe_path}"
+(goto) 2>nul & rmdir /s /q "{script_dir}"
+exit /b 0
+
+:failed
 echo.
-echo Update successful! Cleaning up and exiting...
-start /b "" cmd /c "timeout /t 1 /nobreak > nul && rmdir /s /q {quoted_temp_dir}" & exit
+echo UPDATE FAILED while copying the new files into "{app_path}".
+echo Your installation may be incomplete - please reinstall CrossPatch manually
+echo from https://github.com/Robocnop/CrossPatch/releases
+echo.
+pause
+exit /b 1
 """
             with open(script_path, 'w') as f:
                 f.write(script_content)
@@ -168,76 +200,76 @@ start /b "" cmd /c "timeout /t 1 /nobreak > nul && rmdir /s /q {quoted_temp_dir}
             time.sleep(1)
 
         else: # Linux
-            script_path = os.path.join(self.temp_dir, 'updater.sh')
+            script_path = os.path.join(script_dir, 'updater.sh')
             script_content = f"""#!/bin/bash
-echo "Waiting for CrossPatch (PID: {pid}) to close..."
-while kill -0 {pid} 2>/dev/null; do
+PID={pid}
+APP_DIR={shlex.quote(app_path)}
+APP_EXE={shlex.quote(app_exe_path)}
+SRC_DIR={shlex.quote(source_path)}
+TEMP_DIR={shlex.quote(self.temp_dir)}
+SCRIPT_DIR={shlex.quote(script_dir)}
+
+echo "Waiting for CrossPatch (PID: $PID) to close..."
+WAITED=0
+while kill -0 "$PID" 2>/dev/null; do
     sleep 1
+    WAITED=$((WAITED + 1))
+    if [ "$WAITED" -ge 15 ]; then
+        echo "CrossPatch did not exit on its own, closing it now..."
+        kill -9 "$PID" 2>/dev/null
+        sleep 2
+        break
+    fi
 done
 
-echo "Updating files..."
-if [ $(ls -1 "{source_path}" | wc -l) -eq 1 ]; then
-    echo "Single-file update detected. Replacing binary..."
-    mv -f "{source_path}/{app_executable}" "{os.path.join(app_path, app_executable)}"
-else
-    echo "Directory update detected. Copying files..."
-    cp -rf "{source_path}/"* "{app_path}/"
+echo "Updating files in $APP_DIR..."
+# Trailing '/.' copies the contents, dotfiles included, without nesting them.
+if ! cp -a "$SRC_DIR/." "$APP_DIR/"; then
+    echo ""
+    echo "UPDATE FAILED while copying the new files into $APP_DIR."
+    echo "Your installation may be incomplete - please reinstall CrossPatch"
+    echo "manually from https://github.com/Robocnop/CrossPatch/releases"
+    echo ""
+    read -r -p "Press Enter to close..."
+    exit 1
 fi
 
-echo "Relaunching CrossPatch..."
-chmod +x "{os.path.join(app_path, app_executable)}"
-"{os.path.join(app_path, app_executable)}" &
+chmod +x "$APP_EXE"
 
 echo "Cleaning up temporary files..."
-rm -rf "{self.temp_dir}"
+rm -rf "$TEMP_DIR"
+
+echo "Relaunching CrossPatch..."
+nohup "$APP_EXE" >/dev/null 2>&1 &
+
+# Detached, so this script's own directory is removed after it has exited.
+nohup bash -c 'sleep 2; rm -rf "$1"' _ "$SCRIPT_DIR" >/dev/null 2>&1 &
 """
             with open(script_path, 'w') as f:
                 f.write(script_content)
             os.chmod(script_path, 0o755)
             subprocess.Popen([script_path], start_new_session=True)
+            time.sleep(1)
 
     def _extract_archive(self, archive_path, dest_path, progress_signal=None, clean_destination=True, finished_signal=None):
         """
-        Extracts an archive to a destination path and handles nested folders.
-        (Copied from Util to avoid circular import)
+        Extracts a release archive to a destination path.
+
+        Delegates to Util.extract_archive, which flattens the single top-level
+        folder that the release zips wrap everything in. This used to be a local
+        copy of that function, but the copy had lost the flattening step, so the
+        updater scripts were handed '<extracted>/CrossPatch/...' instead of
+        '<extracted>/...' and every update silently landed in the wrong place.
         """
-        from Util import find_assets_dir # Local import
-        print(f"Starting extraction of '{os.path.basename(archive_path)}' to '{dest_path}'")
-        
-        if clean_destination:
-            if os.path.isdir(dest_path):
-                print(f"Destination '{dest_path}' exists. Removing for clean extraction.")
-                shutil.rmtree(dest_path)
-        os.makedirs(dest_path, exist_ok=True)
+        if progress_signal:
+            progress_signal.emit(tr("updater.extracting"))
+        Util.extract_archive(
+            archive_path,
+            dest_path,
+            progress_signal=None,  # already emitted above, translated
+            clean_destination=clean_destination,
+            finished_signal=finished_signal,
+        )
 
-        archive_format = os.path.splitext(archive_path)[1].lower()
-        print(f"Detected archive format: {archive_format}")
-
-        if progress_signal: progress_signal.emit(tr("updater.extracting"))
-
-        if archive_format == '.zip':
-            import zipfile
-            print("Using zipfile to extract.")
-            with zipfile.ZipFile(archive_path, 'r') as z_ref:
-                z_ref.extractall(dest_path)
-        elif archive_format == '.7z' and Util.PY7ZR_SUPPORT:
-            import py7zr
-            print("Using py7zr to extract.")
-            with py7zr.SevenZipFile(archive_path, 'r') as z_ref:
-                z_ref.extractall(path=dest_path)
-        elif archive_format == '.rar' and Util.UNRAR_SUPPORT:
-            import rarfile
-            print("Using unrar to extract.")
-            assets_dir = find_assets_dir()
-            unrar_tool_name = "UnRAR.exe" if platform.system() == "Windows" else "unrar"
-            bundled_tool_path = os.path.join(assets_dir, unrar_tool_name)
-
-            if os.path.exists(bundled_tool_path):
-                rarfile.UNRAR_TOOL = bundled_tool_path
-            else:
-                rarfile.UNRAR_TOOL = "unrar"
-
-            with rarfile.RarFile(archive_path) as rf:
-                rf.extractall(path=dest_path)
-        else:
-            raise NotImplementedError(f"Unsupported archive format: {archive_format}. Please install the required library if available.")
+        if not os.listdir(dest_path):
+            raise RuntimeError(f"The downloaded archive '{os.path.basename(archive_path)}' extracted to nothing.")
