@@ -71,6 +71,20 @@ class ProfileManager:
         self.save()
         return True
 
+    def create_profile_from_data(self, name, profile_data):
+        """Registers a profile built elsewhere, an imported one for instance.
+
+        Unlike create_profile this does not copy the active profile: the caller
+        supplies the enabled mods, the load order and the configurations.
+        """
+        if not name or not name.strip() or name in self.config["profiles"]:
+            return False
+
+        self.config["profiles"][name] = copy.deepcopy(profile_data)
+        self.set_active_profile(name)
+        self.save()
+        return True
+
     def rename_profile(self, old_name, new_name):
         """Renames a profile."""
         if old_name == self.DEFAULT_PROFILE_NAME or not new_name or not new_name.strip() or new_name in self.config["profiles"]:

@@ -95,10 +95,14 @@ class ProgressDialog(QDialog):
         self.label.setText(text)
 
 class DownloadManager:
-    def __init__(self, parent, mods_folder, on_complete=None):
+    def __init__(self, parent, mods_folder, on_complete=None, refresh_browse=True):
         self.parent = parent
         self.mods_folder = mods_folder
         self.on_complete = on_complete
+        # A profile import runs one download per mod, and refreshing the browse
+        # tab between each of them would mean a pointless API round trip and a
+        # fresh batch of image loads every time.
+        self.refresh_browse = refresh_browse
         self.progress_dialog = None
         self.signals = DownloadSignals()
 
@@ -125,7 +129,7 @@ class DownloadManager:
         if hasattr(self, 'on_complete') and self.on_complete:
             QTimer.singleShot(100, self.on_complete)
         # Also refresh the browse tab if it exists on the parent, to reflect any changes.
-        if hasattr(self.parent, 'fetch_browse_mods'):
+        if self.refresh_browse and hasattr(self.parent, 'fetch_browse_mods'):
             print("[DEBUG] Download finished. Triggering browse tab refresh.")
             QTimer.singleShot(100, lambda: self.parent.fetch_browse_mods(page=self.parent.browse_current_page))
 
@@ -136,10 +140,13 @@ class DownloadManager:
         if hasattr(self, 'on_complete') and self.on_complete: # Refresh UI even on failure
             QTimer.singleShot(100, self.on_complete)
 
-    def download_specific_file(self, file_info, full_item_data, extract_path_override=None):
+    def download_specific_file(self, file_info, full_item_data, extract_path_override=None,
+                               folder_name=None):
+        """Downloads one file. `folder_name` pins the folder it lands in, which
+        a profile import needs so the mod matches the name the profile uses."""
         dialog_title = tr("dl.title", name=full_item_data.get('_sName', 'Mod'))
         dialog_file_name = file_info.get('_sFile', 'download.zip')
-        thread_args = (file_info, full_item_data, None, None, extract_path_override)
+        thread_args = (file_info, full_item_data, folder_name, None, extract_path_override)
         self._setup_and_start_thread(self._download_and_extract_thread, thread_args, dialog_title, dialog_file_name)
 
     def update_specific_file(self, file_info, full_item_data, mod_folder_name, active_profile):
@@ -325,6 +332,10 @@ class DownloadManager:
                 "author": author,
                 "mod_page": page_url or "",
                 "mod_type": existing_info.get('mod_type', 'pak'), # Preserve auto-detected type
+                # Which archive of the submission this is. A submission often
+                # offers several, so a shared profile needs this to install the
+                # same one rather than asking the recipient to guess.
+                "source_file": file_info.get('_sFile') or existing_info.get('source_file') or "",
                 "replaced_files": [],
             }
 

@@ -12,6 +12,8 @@ CrossPatch is an easy to use mod manager for Sonic Racing: Crossworlds
 - Automatic folder creation, no need to set up your ~mods folder in the game files
 - Supports both Pak and UE4SS mods
 - Support for custom mod display names, authors, version numbers, updating etc.
+- Mod profiles, and shareable ones: export your setup to a file that rebuilds
+  itself on someone else's install
 - Simple, Clean, and easy to use UI
 - Ability to launch the game via CrossPatch
 - Functions on both Windows and Linux
@@ -40,6 +42,30 @@ This is *not* your game's `~mods` folder — CrossPatch copies the enabled mods 
 game itself when you apply or launch.
 
 If you set `CROSSPATCH_PORTABLE=1`, the mods folder is `mods/` next to the executable instead.
+
+### Sharing a profile
+
+A profile is a set of mods, the order they load in and which of them are on.
+**Settings > Profile** has an export and an import button next to the profile
+picker.
+
+Exporting writes a small `.crosspatch` file. It holds the list of mods, their
+GameBanana pages and your load order, nothing else: no mod files are copied, so
+the file stays a few kilobytes and nobody's work gets redistributed.
+
+Importing one creates a new profile, downloads every mod it lists that you do
+not already have, and switches to it. Mods you already own are recognised by
+their GameBanana page, whatever you called their folder, so nothing is
+downloaded twice. If a submission offers several archives and the profile does
+not say which one was used, CrossPatch asks rather than guessing.
+
+Two things a shared profile cannot do:
+
+- A mod its author installed by hand has no GameBanana page recorded, so there
+  is nothing to download it from. Those are listed as **No download link** and
+  left out; you have to find them yourself.
+- A mod whose page has since been taken down is reported at the end of the
+  import instead of failing quietly.
 
 ### Languages
 

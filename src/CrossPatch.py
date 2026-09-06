@@ -27,9 +27,11 @@ from OneClickInstallDialog import OneClickInstallDialog
 from EditMod import EditModWindow
 from ModConfigDialog import ModConfigDialog
 from ProfileManager import ProfileManager
+from ProfileImportDialog import ProfileImportDialog, ProfileImportRunner
 import Config
 import Util
 import Localization
+import ProfileSharing
 from Localization import tr
 from Constants import APP_TITLE, APP_VERSION
 import PakInspector
@@ -515,6 +517,16 @@ class CrossPatchWindow(QMainWindow):
         delete_profile_btn.clicked.connect(self.delete_profile)
         profile_layout.addWidget(delete_profile_btn)
 
+        export_profile_btn = QPushButton(self.style().standardIcon(QStyle.SP_DialogSaveButton), "")
+        export_profile_btn.setToolTip(tr("settings.profile.export"))
+        export_profile_btn.clicked.connect(self.export_profile)
+        profile_layout.addWidget(export_profile_btn)
+
+        import_profile_btn = QPushButton(self.style().standardIcon(QStyle.SP_DialogOpenButton), "")
+        import_profile_btn.setToolTip(tr("settings.profile.import"))
+        import_profile_btn.clicked.connect(self.import_profile)
+        profile_layout.addWidget(import_profile_btn)
+
         settings_layout.addWidget(profile_frame)
         self.update_profile_selector()
 
@@ -646,7 +658,7 @@ class CrossPatchWindow(QMainWindow):
 
         self.save_btn = QPushButton(self.style().standardIcon(QStyle.SP_DialogSaveButton), tr("bottom.save"))
         self.save_btn.setToolTip(tr("bottom.save_tip"))
-        self.save_btn.clicked.connect(self.save_and_apply_mods)
+        self.save_btn.clicked.connect(lambda: self.save_and_apply_mods())
         bottom_button_layout.addWidget(self.save_btn)
 
 
@@ -1054,17 +1066,24 @@ class CrossPatchWindow(QMainWindow):
         finally:
             self.tree.blockSignals(False)
 
-    def save_and_apply_mods(self):
+    def save_and_apply_mods(self, use_profile_priority=False):
         """
         Saves changes and refreshes the mod list. This is similar to save_and_launch
         but does not start the game.
+
+        Callers that just switched profile pass use_profile_priority: the tree
+        still lists the profile being left, so taking the order from it would
+        write that order over the load order of the profile now active.
         """
         self.launch_btn.setEnabled(False)
         self.status_label.setText(tr("status.applying"))
 
-        # Capture current_priority from the UI thread before starting the worker.
-        # This ensures we save the user's latest drag-and-drop changes.
-        current_priority = [self.tree.topLevelItem(i).data(0, Qt.UserRole) for i in range(self.tree.topLevelItemCount())]
+        if use_profile_priority:
+            current_priority = list(self.profile_manager.get_active_profile().get("mod_priority", []))
+        else:
+            # Capture current_priority from the UI thread before starting the worker.
+            # This ensures we save the user's latest drag-and-drop changes.
+            current_priority = [self.tree.topLevelItem(i).data(0, Qt.UserRole) for i in range(self.tree.topLevelItemCount())]
 
         # Before starting the worker, explicitly save the profile data which now
         # contains any pending checkbox changes.
@@ -1541,7 +1560,7 @@ class CrossPatchWindow(QMainWindow):
             Config.save_config(self.cfg)
             # Pick up whatever is already sitting in the newly selected folder.
             self._sync_priority_with_disk()
-            self.save_and_apply_mods()
+            self.save_and_apply_mods(use_profile_priority=True)
 
     def on_change_game_root(self):
         new_root = QFileDialog.getExistingDirectory(self, "Select Crossworlds Install Folder", self.cfg["game_root"])
@@ -1564,7 +1583,7 @@ class CrossPatchWindow(QMainWindow):
     def on_profile_change(self):
         new_profile = self.profile_selector.currentText()
         if self.profile_manager.set_active_profile(new_profile):
-            self.save_and_apply_mods()
+            self.save_and_apply_mods(use_profile_priority=True)
 
     def add_profile(self):
         new_name, ok = QInputDialog.getText(self, tr("profile.new.title"), tr("profile.new.prompt"))
@@ -1588,6 +1607,113 @@ class CrossPatchWindow(QMainWindow):
             else:
                 QMessageBox.critical(self, tr("common.error"), tr("profile.error.exists"))
 
+    def export_profile(self):
+        """Writes the active profile to a file that can be handed to someone else."""
+        profile_name = self.profile_manager.get_active_profile_name()
+        # Check box changes only live in memory until something saves them.
+        self.profile_manager.save()
+
+        payload = ProfileSharing.build_export(
+            profile_name,
+            self.profile_manager.get_active_profile(),
+            self.cfg["mods_folder"],
+            APP_VERSION,
+        )
+        if not payload["mods"]:
+            QMessageBox.information(self, tr("profile.export.title"), tr("profile.export.empty"))
+            return
+
+        suggested = os.path.join(os.path.expanduser("~"),
+                                 ProfileSharing.suggested_file_name(profile_name))
+        path, _ = QFileDialog.getSaveFileName(self, tr("profile.export.title"), suggested,
+                                              tr("profile.share.filter"))
+        if not path:
+            return
+        if not os.path.splitext(path)[1]:
+            path += ProfileSharing.FILE_EXTENSION
+
+        try:
+            ProfileSharing.write_export(path, payload)
+        except Exception as e:
+            QMessageBox.critical(self, tr("common.error"), tr("profile.export.failed", error=e))
+            return
+
+        body = tr("profile.export.done.body", name=profile_name, path=path,
+                  count=len(payload["mods"]))
+        # A mod installed by hand has no page to download it from, so whoever
+        # imports the profile will have to find it themselves. Better said now
+        # than discovered by the other person.
+        orphans = [mod["name"] for mod in payload["mods"] if not mod["mod_page"]]
+        if orphans:
+            body += tr("profile.export.done.unavailable", count=len(orphans),
+                       names="\n".join(f"- {name}" for name in orphans))
+        QMessageBox.information(self, tr("profile.export.done.title"), body)
+
+    def import_profile(self):
+        """Rebuilds a shared profile here, downloading whatever is missing."""
+        path, _ = QFileDialog.getOpenFileName(self, tr("profile.import.title"), "",
+                                              tr("profile.share.filter"))
+        if not path:
+            return
+
+        try:
+            payload = ProfileSharing.read_export(path)
+        except ValueError as e:
+            QMessageBox.critical(self, tr("common.error"), tr("profile.import.invalid", error=e))
+            return
+        except Exception as e:
+            QMessageBox.critical(self, tr("common.error"), tr("profile.import.unreadable", error=e))
+            return
+
+        entries = ProfileSharing.plan_import(payload, self.cfg["mods_folder"])
+        if not entries:
+            QMessageBox.information(self, tr("profile.import.title"), tr("profile.import.empty"))
+            return
+
+        dialog = ProfileImportDialog(self, payload, entries,
+                                     self.profile_manager.get_profile_names())
+        if not dialog.exec():
+            return
+
+        self._import_profile_name = dialog.get_profile_name()
+        self._import_runner = ProfileImportRunner(self, entries, self.cfg["mods_folder"])
+        self._import_runner.progress.connect(self.status_label.setText)
+        self._import_runner.finished.connect(self._on_profile_import_finished)
+        self._import_runner.start()
+
+    def _on_profile_import_finished(self, entries):
+        """Creates the profile once every download has had its turn."""
+        self.status_label.setText(tr("status.idle", version=APP_VERSION))
+        name = getattr(self, "_import_profile_name", "")
+        self._import_runner = None
+
+        data = ProfileSharing.profile_from_entries(entries)
+        if not data["mod_priority"]:
+            QMessageBox.warning(self, tr("common.error"), tr("profile.import.nothing"))
+            return
+
+        if not self.profile_manager.create_profile_from_data(name, data):
+            QMessageBox.critical(self, tr("common.error"), tr("profile.import.name_taken", name=name))
+            return
+
+        self.update_profile_selector()
+
+        downloaded = sum(1 for e in entries
+                         if not e["skipped"] and e["status"] == ProfileSharing.STATUS_DOWNLOAD)
+        present = sum(1 for e in entries
+                      if not e["skipped"] and e["status"] == ProfileSharing.STATUS_INSTALLED)
+        skipped = [e for e in entries if e["skipped"]]
+
+        body = tr("profile.import.done.body", name=name, installed=downloaded,
+                  present=present, skipped=len(skipped))
+        failures = [e for e in skipped if e["error"]]
+        if failures:
+            body += tr("profile.import.done.failed",
+                       names="\n".join(f"- {e['name']}: {e['error']}" for e in failures))
+        QMessageBox.information(self, tr("profile.import.done.title"), body)
+
+        self.save_and_apply_mods(use_profile_priority=True)
+
     def delete_profile(self):
         profile_to_delete = self.profile_manager.get_active_profile_name()
 
@@ -1604,7 +1730,7 @@ class CrossPatchWindow(QMainWindow):
         if reply == QMessageBox.Yes:
             if self.profile_manager.delete_profile(profile_to_delete):
                 self.update_profile_selector()
-                self.save_and_apply_mods()
+                self.save_and_apply_mods(use_profile_priority=True)
 
     # --- Browse Mods Tab Methods ---
 
