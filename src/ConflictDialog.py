@@ -7,6 +7,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QSize
 from PySide6.QtGui import QFont
 from Util import add_ignored_conflict
+from Localization import tr
 
 
 class ConflictDialog(QDialog):
@@ -22,7 +23,7 @@ class ConflictDialog(QDialog):
             conflicts: dict mapping game file path -> list of (provider_mod, pak_name) tuples
         """
         super().__init__(parent)
-        self.setWindowTitle("Mod Conflict Detected")
+        self.setWindowTitle(tr("conflict.title"))
         self.setModal(True)
         self.setMinimumWidth(850)
 
@@ -32,7 +33,7 @@ class ConflictDialog(QDialog):
         main_layout = QVBoxLayout(self)
 
         # --- Summary ---
-        summary_text = f"The following mods conflict with each other (they modify the same game files):"
+        summary_text = tr("conflict.summary")
         main_layout.addWidget(QLabel(summary_text))
 
         # --- Conflicting Mods Summary ---
@@ -45,11 +46,11 @@ class ConflictDialog(QDialog):
         self.details_widget = QWidget()
         details_layout = QVBoxLayout(self.details_widget)
         details_layout.setContentsMargins(0, 5, 0, 0)
-        details_layout.addWidget(QLabel("<b>Conflicting Files:</b>"))
+        details_layout.addWidget(QLabel(tr("conflict.files_header")))
 
         self.details_tree = QTreeWidget()
         self.details_tree.setColumnCount(2)
-        self.details_tree.setHeaderLabels(["File Path", "Provided By"])
+        self.details_tree.setHeaderLabels([tr("conflict.col.path"), tr("conflict.col.provider")])
         self.details_tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
         self.details_tree.header().setSectionResizeMode(1, QHeaderView.Interactive)
         self.details_tree.setSortingEnabled(True)
@@ -62,7 +63,7 @@ class ConflictDialog(QDialog):
         # --- Buttons ---
         button_layout = QHBoxLayout()
 
-        self.details_button = QPushButton("View Details")
+        self.details_button = QPushButton(tr("conflict.details_btn"))
         self.details_button.setCheckable(True)
         self.details_button.toggled.connect(self.details_widget.setVisible)
         button_layout.addWidget(self.details_button)
@@ -70,8 +71,8 @@ class ConflictDialog(QDialog):
         button_layout.addStretch()
 
         button_box = QDialogButtonBox()
-        self.ignore_button = button_box.addButton("Ignore Future Conflicts", QDialogButtonBox.ActionRole)
-        self.ok_button = button_box.addButton("OK", QDialogButtonBox.AcceptRole)
+        self.ignore_button = button_box.addButton(tr("conflict.ignore_btn"), QDialogButtonBox.ActionRole)
+        self.ok_button = button_box.addButton(tr("common.ok"), QDialogButtonBox.AcceptRole)
         self.ignore_button.clicked.connect(self.on_ignore)
         self.ok_button.clicked.connect(self.accept)
         button_layout.addWidget(button_box)
@@ -89,7 +90,7 @@ class ConflictDialog(QDialog):
                     mod_pairs.add(tuple(sorted((mod_names[i], mod_names[j]))))
         
         if not mod_pairs:
-            self.conflicting_mods_list.addTopLevelItem(QTreeWidgetItem(["No conflicts found."]))
+            self.conflicting_mods_list.addTopLevelItem(QTreeWidgetItem([tr("conflict.none")]))
             return
 
         print("\n--- Mod Conflict Summary ---")

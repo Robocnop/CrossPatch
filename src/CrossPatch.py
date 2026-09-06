@@ -29,6 +29,8 @@ from ModConfigDialog import ModConfigDialog
 from ProfileManager import ProfileManager
 import Config
 import Util
+import Localization
+from Localization import tr
 from Constants import APP_TITLE, APP_VERSION
 import PakInspector
 
@@ -97,7 +99,7 @@ class ModCard(QFrame):
         layout.setSpacing(5)
 
         # Image Label
-        self.image_label = QLabel("Loading...")
+        self.image_label = QLabel(tr("card.loading"))
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setFixedSize(210, 118) # 16:9 aspect ratio
         self.image_label.setStyleSheet("background-color: #2a2a2a; border-radius: 3px;")
@@ -112,7 +114,7 @@ class ModCard(QFrame):
 
         # Author
         author = self.mod_data.get('_aSubmitter', {}).get('_sName', 'N/A')
-        author_label = QLabel(f"by {author}")
+        author_label = QLabel(tr("card.by", author=author))
         layout.addWidget(author_label)
 
         layout.addStretch()
@@ -127,7 +129,7 @@ class ModCard(QFrame):
         layout.addLayout(stats_layout)
 
         # Download Button
-        download_btn = QPushButton(self.style().standardIcon(QStyle.SP_ArrowDown), " Download")
+        download_btn = QPushButton(self.style().standardIcon(QStyle.SP_ArrowDown), tr("card.download"))
         download_btn.clicked.connect(self.on_download_clicked)
         layout.addWidget(download_btn)
 
@@ -250,13 +252,28 @@ class CrossPatchWindow(QMainWindow):
     # Signal for app update check
     update_check_finished = Signal(str, dict)
 
+    # Tabs are identified by index, never by label: the label changes with the
+    # interface language, which used to silently disable the buttons, the
+    # browse tab and Ctrl+F as soon as the app was not in English.
+    TAB_MODS = 0
+    TAB_BROWSE = 1
+    TAB_SETTINGS = 2
+
     def __init__(self, instance_socket=None):
         super().__init__()
         self.instance_socket = instance_socket
 
         # --- Core App Data ---
         self.cfg = Config.load_config()
+        # Before any widget is built, so every label comes out translated.
+        Localization.init(self.cfg)
+        Localization.install_qt_translations()
         self.profile_manager = ProfileManager(self.cfg)
+        # The console setting was saved but never applied on startup, so people
+        # who turned logs on to diagnose a problem got nothing after a restart.
+        if self.cfg.get("show_cmd_logs"):
+            Config.show_console()
+        self._verify_mods_folder()
         self.updatable_mods = {}
         self.active_download_manager = None # To hold a reference
         self._resize_timer = None
@@ -288,19 +305,23 @@ class CrossPatchWindow(QMainWindow):
         main_layout.addWidget(self.notebook)
 
         self.mods_tab_frame = QWidget()
-        self.notebook.addTab(self.mods_tab_frame, "Installed Mods")
+        self.notebook.addTab(self.mods_tab_frame, tr("window.tab.installed"))
 
         # Create and populate the primary mods tab first for faster perceived startup.
         self._create_mods_tab_ui()
+        # The tree only lists mods present in mod_priority, so anything already
+        # on disk (mods copied in by hand, or every mod after a config reset)
+        # used to stay invisible until the user pressed Refresh.
+        self._sync_priority_with_disk()
         self._update_treeview()
 
         # --- Build UI for other tabs and bottom bar ---
         self.browse_tab_frame = QWidget()
-        self.notebook.addTab(self.browse_tab_frame, "Browse Mods")
+        self.notebook.addTab(self.browse_tab_frame, tr("window.tab.browse"))
         self._create_browse_tab_ui()
 
         self.settings_tab_frame = QWidget()
-        self.notebook.addTab(self.settings_tab_frame, "Settings")
+        self.notebook.addTab(self.settings_tab_frame, tr("window.tab.settings"))
         self._create_settings_tab_ui()
 
         self._create_bottom_bar()
@@ -321,6 +342,32 @@ class CrossPatchWindow(QMainWindow):
         threading.Thread(target=lambda: self.check_all_mod_updates(), daemon=True).start()
         self.set_dark_title_bar()
 
+    def _verify_mods_folder(self):
+        """Creates the configured mods folder, warning the user if it fails."""
+        folder = self.cfg.get("mods_folder")
+        if Config.ensure_mods_folder(folder):
+            return
+
+        QMessageBox.warning(
+            self,
+            tr("modsfolder.unavailable.title"),
+            tr("modsfolder.unavailable.body", path=folder),
+        )
+
+    def _sync_priority_with_disk(self):
+        """Adds mods found on disk to the active profile's priority list."""
+        try:
+            mods_folder = self.cfg.get("mods_folder")
+            if not mods_folder or not os.path.isdir(mods_folder):
+                return
+            profile = self.profile_manager.get_active_profile()
+            current = profile.get("mod_priority", [])
+            synced = Util.synchronize_priority_with_disk(current, Util.list_mod_folders(mods_folder))
+            if synced != current:
+                self.profile_manager.set_mod_priority(synced)
+        except Exception as e:
+            print(f"Could not synchronize the mod list with disk: {e}")
+
     def _create_mods_tab_ui(self):
         mods_layout = QVBoxLayout(self.mods_tab_frame)
 
@@ -328,9 +375,9 @@ class CrossPatchWindow(QMainWindow):
         self.search_frame = QFrame()
         search_layout = QHBoxLayout(self.search_frame)
         search_layout.setContentsMargins(0,0,0,0)
-        search_layout.addWidget(QLabel("Search:"))
+        search_layout.addWidget(QLabel(tr("mods.search")))
         self.search_entry = QLineEdit()
-        self.search_entry.setPlaceholderText("Filter by name, author, etc.")
+        self.search_entry.setPlaceholderText(tr("mods.search_placeholder"))
         self.search_entry.textChanged.connect(self._update_treeview)
         search_layout.addWidget(self.search_entry)
         mods_layout.addWidget(self.search_frame)
@@ -339,7 +386,8 @@ class CrossPatchWindow(QMainWindow):
         # Mods List (Treeview)
         self.tree = ModTreeWidget()
         self.tree.setColumnCount(7)
-        self.tree.setHeaderLabels(["", "", "Mod Name", "Version", "Author", "Type", "Config"])
+        self.tree.setHeaderLabels(["", "", tr("mods.col.name"), tr("mods.col.version"),
+                                   tr("mods.col.author"), tr("mods.col.type"), tr("mods.col.config")])
         self.tree.setSelectionMode(QTreeWidget.SingleSelection)
         self.tree.setDragDropMode(QTreeWidget.InternalMove)
         self.tree.setDragEnabled(True)
@@ -373,23 +421,30 @@ class CrossPatchWindow(QMainWindow):
 
         # --- Filters and Search ---
         filter_bar = QHBoxLayout()
-        filter_bar.addWidget(QLabel("<b>Featured Mods</b>"))
+        filter_bar.addWidget(QLabel(tr("browse.featured")))
 
         filter_bar.addStretch()
 
-        filter_bar.addWidget(QLabel("Search:"))
+        filter_bar.addWidget(QLabel(tr("browse.search")))
         self.browse_search_entry = QLineEdit()
-        self.browse_search_entry.setPlaceholderText("Search GameBanana...")
+        self.browse_search_entry.setPlaceholderText(tr("browse.search_placeholder"))
         self.browse_search_entry.returnPressed.connect(lambda: self.fetch_browse_mods(page=1))
         filter_bar.addWidget(self.browse_search_entry)
 
-        self.browse_clear_search_btn = QPushButton("Clear")
+        self.browse_clear_search_btn = QPushButton(tr("common.clear"))
         self.browse_clear_search_btn.clicked.connect(self.clear_browse_search)
         self.browse_clear_search_btn.setVisible(False)
         self.browse_search_entry.textChanged.connect(lambda text: self.browse_clear_search_btn.setVisible(bool(text)))
         filter_bar.addWidget(self.browse_clear_search_btn)
 
         browse_layout.addLayout(filter_bar)
+
+        # Shown when the results are only approximate matches.
+        self.browse_notice_label = QLabel()
+        self.browse_notice_label.setWordWrap(True)
+        self.browse_notice_label.setStyleSheet("color: #e6b800; padding: 4px;")
+        self.browse_notice_label.hide()
+        browse_layout.addWidget(self.browse_notice_label)
 
         # --- Mod Browser Card Layout ---
         self.scroll_area = QScrollArea()
@@ -406,16 +461,16 @@ class CrossPatchWindow(QMainWindow):
 
         # --- Pagination and Download ---
         page_bar = QHBoxLayout()
-        self.browse_prev_btn = QPushButton("<< Previous")
+        self.browse_prev_btn = QPushButton(tr("browse.prev"))
         self.browse_prev_btn.clicked.connect(self.browse_prev_page)
         self.browse_prev_btn.setEnabled(False)
         page_bar.addWidget(self.browse_prev_btn)
 
-        self.browse_page_label = QLabel("Page 1")
+        self.browse_page_label = QLabel(tr("browse.page", page=1))
         self.browse_page_label.setAlignment(Qt.AlignCenter)
         page_bar.addWidget(self.browse_page_label)
 
-        self.browse_next_btn = QPushButton("Next >>")
+        self.browse_next_btn = QPushButton(tr("browse.next"))
         self.browse_next_btn.clicked.connect(self.browse_next_page)
         page_bar.addWidget(self.browse_next_btn)
 
@@ -438,7 +493,7 @@ class CrossPatchWindow(QMainWindow):
         profile_frame = QFrame()
         profile_frame.setFrameShape(QFrame.StyledPanel)
         profile_layout = QHBoxLayout(profile_frame)
-        profile_layout.addWidget(QLabel("<b>Profile:</b>"))
+        profile_layout.addWidget(QLabel(tr("settings.profile")))
 
         self.profile_selector = QComboBox()
         self.profile_selector.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -446,17 +501,17 @@ class CrossPatchWindow(QMainWindow):
         profile_layout.addWidget(self.profile_selector)
 
         add_profile_btn = QPushButton(self.style().standardIcon(QStyle.SP_FileDialogNewFolder), "")
-        add_profile_btn.setToolTip("Add new profile")
+        add_profile_btn.setToolTip(tr("settings.profile.add"))
         add_profile_btn.clicked.connect(self.add_profile)
         profile_layout.addWidget(add_profile_btn)
 
         rename_profile_btn = QPushButton(self.style().standardIcon(QStyle.SP_FileLinkIcon), "")
-        rename_profile_btn.setToolTip("Rename current profile")
+        rename_profile_btn.setToolTip(tr("settings.profile.rename"))
         rename_profile_btn.clicked.connect(self.rename_profile)
         profile_layout.addWidget(rename_profile_btn)
 
         delete_profile_btn = QPushButton(self.style().standardIcon(QStyle.SP_TrashIcon), "")
-        delete_profile_btn.setToolTip("Delete current profile")
+        delete_profile_btn.setToolTip(tr("settings.profile.delete"))
         delete_profile_btn.clicked.connect(self.delete_profile)
         profile_layout.addWidget(delete_profile_btn)
 
@@ -470,7 +525,7 @@ class CrossPatchWindow(QMainWindow):
 
         # Game Directory
         game_root_layout = QHBoxLayout()
-        game_root_layout.addWidget(QLabel("Game Directory:"))
+        game_root_layout.addWidget(QLabel(tr("settings.game_dir")))
         self.game_root_var = QLineEdit(self.cfg["game_root"])
         self.game_root_var.setReadOnly(True)
         game_root_layout.addWidget(self.game_root_var)
@@ -481,7 +536,7 @@ class CrossPatchWindow(QMainWindow):
 
         # Mods Folder
         mods_folder_layout = QHBoxLayout()
-        mods_folder_layout.addWidget(QLabel("Mods Folder:"))
+        mods_folder_layout.addWidget(QLabel(tr("settings.mods_folder")))
         self.mods_folder_var = QLineEdit(self.cfg["mods_folder"])
         self.mods_folder_var.setReadOnly(True)
         mods_folder_layout.addWidget(self.mods_folder_var)
@@ -490,6 +545,16 @@ class CrossPatchWindow(QMainWindow):
         mods_folder_layout.addWidget(mods_folder_btn)
         paths_layout.addLayout(mods_folder_layout)
 
+        # Interface language
+        language_layout = QHBoxLayout()
+        language_layout.addWidget(QLabel(tr("settings.language")))
+        self.language_selector = QComboBox()
+        self._populate_language_selector()
+        self.language_selector.setToolTip(tr("settings.language.tip", path=Localization.user_locales_dir()))
+        self.language_selector.activated.connect(self.on_change_language)
+        language_layout.addWidget(self.language_selector)
+        paths_layout.addLayout(language_layout)
+
         settings_layout.addWidget(paths_frame)
 
         # --- Other Settings ---
@@ -497,15 +562,15 @@ class CrossPatchWindow(QMainWindow):
         other_frame.setFrameShape(QFrame.StyledPanel)
         other_layout = QVBoxLayout(other_frame)
 
-        self.show_logs_var = QCheckBox("Show console logs")
+        self.show_logs_var = QCheckBox(tr("settings.show_logs"))
         self.show_logs_var.setChecked(self.cfg.get("show_cmd_logs", False))
         self.show_logs_var.toggled.connect(self.on_toggle_logs)
         if platform.system() == "Windows":
             other_layout.addWidget(self.show_logs_var)
 
         # Ignored conflicts management
-        ignored_btn = QPushButton("Ignored Conflicts...")
-        ignored_btn.setToolTip("View and clear ignored conflict pairs")
+        ignored_btn = QPushButton(tr("settings.ignored_conflicts"))
+        ignored_btn.setToolTip(tr("settings.ignored_conflicts.tip"))
         ignored_btn.clicked.connect(self.open_ignored_conflicts)
         other_layout.addWidget(ignored_btn)
 
@@ -516,11 +581,46 @@ class CrossPatchWindow(QMainWindow):
         action_frame.setFrameShape(QFrame.StyledPanel)
         action_layout = QHBoxLayout(action_frame)
         action_layout.addStretch()
-        credits_btn = QPushButton("Credits")
+        credits_btn = QPushButton(tr("settings.credits"))
         credits_btn.clicked.connect(self.open_credits)
         action_layout.addWidget(credits_btn)
         action_layout.addStretch()
         settings_layout.addWidget(action_frame)
+
+    def _populate_language_selector(self):
+        """Fills the picker with every catalogue found on disk."""
+        languages = Localization.available_languages()
+        detected_code = Localization.detect_system_language()
+        detected_name = languages.get(detected_code, detected_code)
+
+        self.language_selector.clear()
+        self.language_selector.addItem(tr("settings.language.auto", name=detected_name), Localization.AUTO)
+        for code, name in languages.items():
+            self.language_selector.addItem(name, code)
+
+        current = self.cfg.get("language", Localization.AUTO)
+        index = self.language_selector.findData(current)
+        self.language_selector.setCurrentIndex(index if index != -1 else 0)
+
+    def on_change_language(self):
+        """Saves the chosen language. Widgets are rebuilt on the next start."""
+        code = self.language_selector.currentData()
+        if code == self.cfg.get("language"):
+            return
+
+        self.cfg["language"] = code
+        Config.save_config(self.cfg)
+
+        # Switch straight away so the confirmation is already in the new
+        # language; the rest of the window keeps its current labels.
+        resolved = Localization.set_language(code)
+        Localization.install_qt_translations()
+        name = Localization.available_languages().get(resolved, resolved)
+        QMessageBox.information(
+            self,
+            tr("settings.language.restart.title"),
+            tr("settings.language.restart.body", name=name),
+        )
 
     def open_ignored_conflicts(self):
         try:
@@ -529,7 +629,7 @@ class CrossPatchWindow(QMainWindow):
             dialog = IgnoredConflictsDialog(self)
             dialog.exec()
         except Exception as e:
-            QMessageBox.warning(self, "Error", f"Could not open ignored conflicts dialog: {e}")
+            QMessageBox.warning(self, tr("common.error"), tr("ignored.open_failed.body", error=e))
 
 
     def _create_bottom_bar(self):
@@ -538,15 +638,14 @@ class CrossPatchWindow(QMainWindow):
         bottom_button_layout = QHBoxLayout(self.bottom_button_frame)
         bottom_button_layout.setContentsMargins(0, 5, 0, 5)
 
-        self.refresh_btn = QPushButton(self.style().standardIcon(QStyle.SP_BrowserReload), " Refresh")
-        self.refresh_btn.setToolTip("Refresh mods list")
-        self.refresh_btn.setToolTip("Refresh the mod list from disk")
+        self.refresh_btn = QPushButton(self.style().standardIcon(QStyle.SP_BrowserReload), tr("bottom.refresh"))
+        self.refresh_btn.setToolTip(tr("bottom.refresh_tip"))
         self.refresh_btn.clicked.connect(self.refresh)
         # bottom_button_layout.addWidget(self.refresh_btn) # Replaced by save_btn
         bottom_button_layout.addWidget(self.refresh_btn)
 
-        self.save_btn = QPushButton(self.style().standardIcon(QStyle.SP_DialogSaveButton), " Save")
-        self.save_btn.setToolTip("Save & apply mods")
+        self.save_btn = QPushButton(self.style().standardIcon(QStyle.SP_DialogSaveButton), tr("bottom.save"))
+        self.save_btn.setToolTip(tr("bottom.save_tip"))
         self.save_btn.clicked.connect(self.save_and_apply_mods)
         bottom_button_layout.addWidget(self.save_btn)
 
@@ -554,7 +653,7 @@ class CrossPatchWindow(QMainWindow):
         bottom_button_layout.addStretch()
 
         self.search_btn = QPushButton(QIcon(os.path.join(self.assets_path, 'search.png')), "")
-        self.search_btn.setToolTip("Search mods (Ctrl+F)")
+        self.search_btn.setToolTip(tr("bottom.search_tip"))
         self.search_btn.setCheckable(True)
         self.search_btn.toggled.connect(self.toggle_search_bar)
         bottom_button_layout.addWidget(self.search_btn)
@@ -565,8 +664,8 @@ class CrossPatchWindow(QMainWindow):
         self.centralWidget().layout().addWidget(self.bottom_button_frame)
 
         # --- Launch Button ---
-        launch_btn = QPushButton("Launch Game")
-        launch_btn.setToolTip("Launches CrossWorlds")
+        launch_btn = QPushButton(tr("bottom.launch"))
+        launch_btn.setToolTip(tr("bottom.launch_tip"))
         launch_btn.clicked.connect(self.launch_game_only)
         font = launch_btn.font()
         font.setPointSize(12)
@@ -580,7 +679,7 @@ class CrossPatchWindow(QMainWindow):
         status_widget = QWidget()
         status_layout = QHBoxLayout(status_widget)
         status_layout.setContentsMargins(0, 0, 0, 0)
-        self.status_label = QLabel(f"CrossPatch {APP_VERSION}")
+        self.status_label = QLabel(tr("status.idle", version=APP_VERSION))
         status_layout.addWidget(self.status_label, alignment=Qt.AlignCenter)
 
         status_bar.addWidget(status_widget, 1)
@@ -616,8 +715,7 @@ class CrossPatchWindow(QMainWindow):
 
     def on_tab_change(self, index):
         """Shows or hides mod-related buttons based on the selected tab."""
-        tab_text = self.notebook.tabText(index)
-        is_mods_tab = (tab_text == "Installed Mods")
+        is_mods_tab = (index == self.TAB_MODS)
 
         # self.refresh_btn.setVisible(is_mods_tab)
         self.refresh_btn.setVisible(is_mods_tab)
@@ -637,7 +735,7 @@ class CrossPatchWindow(QMainWindow):
 
     def on_search_hotkey(self):
         """Toggles the search bar only if the 'Installed Mods' tab is active."""
-        if self.notebook.tabText(self.notebook.currentIndex()) == "Installed Mods":
+        if self.notebook.currentIndex() == self.TAB_MODS:
             self.search_btn.toggle()
 
     def on_drag_end(self):
@@ -692,23 +790,23 @@ class CrossPatchWindow(QMainWindow):
         mod_folder_name = item.data(0, Qt.UserRole)
 
         menu = QMenu()
-        menu.addAction("Open containing folder", self.open_selected_mod_folder)
-        menu.addAction("Edit mod info", self.edit_selected_mod_info)
+        menu.addAction(tr("mods.menu.open_folder"), self.open_selected_mod_folder)
+        menu.addAction(tr("mods.menu.edit_info"), self.edit_selected_mod_info)
         menu.addSeparator()
 
         # Add "Configure" option if applicable
         if item.text(6) == "⚙️":
-            menu.addAction("Configure mod...", self.configure_selected_mod)
+            menu.addAction(tr("mods.menu.configure"), self.configure_selected_mod)
 
         # Only show update option if mod has a page URL
         mod_info = Util.read_mod_info(os.path.join(self.cfg["mods_folder"], mod_folder_name))
         if mod_info.get("mod_page", "").startswith("https://gamebanana.com"):
-            menu.addAction("Check for updates", self.check_mod_updates)
+            menu.addAction(tr("mods.menu.check_updates"), self.check_mod_updates)
 
         menu.addSeparator()
-        menu.addAction("View pak contents...", lambda: self.show_pak_contents(mod_folder_name))
+        menu.addAction(tr("mods.menu.view_pak"), lambda: self.show_pak_contents(mod_folder_name))
         menu.addSeparator()
-        menu.addAction(self.style().standardIcon(QStyle.SP_TrashIcon), "Delete mod", self.delete_mod)
+        menu.addAction(self.style().standardIcon(QStyle.SP_TrashIcon), tr("mods.menu.delete"), self.delete_mod)
 
         menu.exec(self.tree.viewport().mapToGlobal(pos))
 
@@ -731,18 +829,19 @@ class CrossPatchWindow(QMainWindow):
                 except Exception as e:
                     print(f"Warning: Could not write pak_data to info.json: {e}")
             except Exception as e:
-                QMessageBox.warning(self, "Pak Inspector", f"Could not analyze pak files: {e}")
+                QMessageBox.warning(self, tr("pak.error.title"), tr("pak.error.body", error=e))
                 return
 
         dialog = QDialog(self)
-        dialog.setWindowTitle(f"Pak Contents - {mod_info.get('name', mod_folder_name)}")
+        dialog.setWindowTitle(tr("pak.title", name=mod_info.get('name', mod_folder_name)))
         layout = QVBoxLayout(dialog)
 
-        summary = QLabel(f"Files: {pak_data.get('total_files', 0)}  Total size: {pak_data.get('total_size', 0)} bytes")
+        summary = QLabel(tr("pak.summary", files=pak_data.get('total_files', 0), size=pak_data.get('total_size', 0)))
         layout.addWidget(summary)
 
         tree = QTreeWidget()
-        headers = ["Name", "Size", "Compressed", "Offset", "Archive", "Source"]
+        headers = [tr("pak.col.name"), tr("pak.col.size"), tr("pak.col.compressed"),
+                   tr("pak.col.offset"), tr("pak.col.archive"), tr("pak.col.source")]
         tree.setColumnCount(len(headers))
         tree.setHeaderLabels(headers)
         header = tree.header()
@@ -791,13 +890,13 @@ class CrossPatchWindow(QMainWindow):
                         parent_item = new_item
         else:
             # Fallback for older pak_data format without a detailed index
-            tree.addTopLevelItem(QTreeWidgetItem(["Pak file index is not detailed enough to build a file tree."]))
+            tree.addTopLevelItem(QTreeWidgetItem([tr("pak.no_index")]))
 
         for i in range(tree.columnCount()):
             tree.resizeColumnToContents(i)
         layout.addWidget(tree)
 
-        close_btn = QPushButton("Close")
+        close_btn = QPushButton(tr("common.close"))
         close_btn.clicked.connect(dialog.accept)
         layout.addWidget(close_btn)
 
@@ -825,7 +924,7 @@ class CrossPatchWindow(QMainWindow):
         Refreshes the mod list from disk. This will find new mods and remove deleted ones.
         It performs a background sync and then updates the UI.
         """
-        self.status_label.setText("Refreshing mod list...")
+        self.status_label.setText(tr("status.refreshing"))
         self.refresh_btn.setEnabled(False)
 
         def refresh_worker():
@@ -837,7 +936,7 @@ class CrossPatchWindow(QMainWindow):
             except Exception as e:
                 print(f"Error during refresh worker: {e}")
                 # Re-enable button and reset status on the main thread
-                QTimer.singleShot(0, lambda: (self.refresh_btn.setEnabled(True), self.status_label.setText(f"CrossPatch {APP_VERSION}")))
+                QTimer.singleShot(0, lambda: (self.refresh_btn.setEnabled(True), self.status_label.setText(tr("status.idle", version=APP_VERSION))))
 
         threading.Thread(target=refresh_worker, daemon=True).start()
 
@@ -961,7 +1060,7 @@ class CrossPatchWindow(QMainWindow):
         but does not start the game.
         """
         self.launch_btn.setEnabled(False)
-        self.status_label.setText("Applying mods...")
+        self.status_label.setText(tr("status.applying"))
 
         # Capture current_priority from the UI thread before starting the worker.
         # This ensures we save the user's latest drag-and-drop changes.
@@ -978,7 +1077,7 @@ class CrossPatchWindow(QMainWindow):
     def launch_game_only(self):
         """Directly launches the game without saving or applying any changes."""
         if not Util.launch_game():
-            QMessageBox.warning(self, "Launch Failed", "Could not issue the command to launch the game.")
+            QMessageBox.warning(self, tr("launch.failed.title"), tr("launch.failed.body"))
 
     def _save_and_launch_worker(self, current_priority_from_main_thread, should_launch_game):
         """Worker for save_and_launch, performs background tasks and launches game."""
@@ -989,8 +1088,8 @@ class CrossPatchWindow(QMainWindow):
             self.mod_processing_finished.emit(new_priority_list, conflicts, launch_success, True)
         except Exception as e:
             print(f"Error during save and launch worker: {e}")
-            QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Error", f"An error occurred during mod processing or launch: {e}"))
-            QTimer.singleShot(0, lambda: (self.launch_btn.setEnabled(True), self.status_label.setText(f"CrossPatch {APP_VERSION}")))
+            QTimer.singleShot(0, lambda: QMessageBox.critical(self, tr("ui.error.title"), tr("ui.error.body", error=e)))
+            QTimer.singleShot(0, lambda: (self.launch_btn.setEnabled(True), self.status_label.setText(tr("status.idle", version=APP_VERSION))))
 
     def _on_mod_processing_finished(self, new_priority_list, conflicts, launch_success, is_launch_operation):
         """
@@ -1011,37 +1110,44 @@ class CrossPatchWindow(QMainWindow):
             # Show conflict dialog (UI)
             # Handle launch success/failure message if this was a launch operation
             if is_launch_operation and not launch_success:
-                QMessageBox.warning(self, "Launch Failed", "Could not issue the command to launch the game.")
+                QMessageBox.warning(self, tr("launch.failed.title"), tr("launch.failed.body"))
         except Exception as e:
             print(f"Error during main thread UI update after mod processing: {e}")
-            QMessageBox.critical(self, "Error", f"An error occurred during UI update: {e}")
+            QMessageBox.critical(self, tr("ui.error.title"), tr("ui.error.body", error=e))
         finally:
             self.launch_btn.setEnabled(True)
             self.refresh_btn.setEnabled(True)
-            self.status_label.setText(f"CrossPatch {APP_VERSION}")
+            self.status_label.setText(tr("status.idle", version=APP_VERSION))
             print("Mod processing and UI update finished.")
 
-            if not is_launch_operation: # Only do this if it's not a launch
-                return
+        # Installing the mods happens outside the try/finally above: a 'return'
+        # inside a 'finally' block silently discards any exception raised in the
+        # try, which hid real installation failures.
+        if not is_launch_operation or self._is_closing:
+            return
 
-            # This is the final step after all background work is done.
-            # This will handle enabling all mods, including showing the batch processor dialog.
+        # This is the final step after all background work is done.
+        # This will handle enabling all mods, including showing the batch processor dialog.
+        try:
             enabled_mods_dict = self.profile_manager.get_active_profile().get("enabled_mods", {})
             Util.enable_mods_from_priority(new_priority_list, enabled_mods_dict, self.cfg, self, self.profile_manager.get_active_profile())
 
             # Refresh the treeview one last time in case the conflict dialog caused changes.
             self._update_treeview(preserve_selection=False)
+        except Exception as e:
+            print(f"Error while installing mods into the game folders: {e}")
+            QMessageBox.critical(self, tr("install.failed.title"), tr("install.failed.body", error=e))
 
     def add_mod_from_url(self, item_data=None):
         if not item_data:
-            url, ok = QInputDialog.getText(self, "Add Mod from URL", "Enter the GameBanana Mod URL:")
+            url, ok = QInputDialog.getText(self, tr("addmod.title"), tr("addmod.prompt"))
             if not ok or not url:
                 return
         else:
             # First, check if the item is a downloadable type. Some items like 'Requests' are not.
             mod_type = item_data.get('_sModelName')
             if mod_type == 'Request':
-                QMessageBox.information(self, "Cannot Download", "This item is a 'Request' and does not have any downloadable files.")
+                QMessageBox.information(self, tr("download.not_downloadable.title"), tr("download.not_downloadable.body"))
                 return
 
             # If item_data is from the browser, it might be incomplete.
@@ -1055,16 +1161,16 @@ class CrossPatchWindow(QMainWindow):
                     # Directly fetch full item_data using the mod's type and ID
                     item_data = Util.get_gb_item_data_by_id(mod_type, mod_id)
                 except Exception as e:
-                    QMessageBox.critical(self, "Download Error", f"Could not get mod details by ID.\n\n{e}")
+                    QMessageBox.critical(self, tr("download.error.title"), tr("download.error.by_id", error=e))
                     return
             else:
-                QMessageBox.critical(self, "Download Error", "Mod data is incomplete: cannot identify mod for download.")
+                QMessageBox.critical(self, tr("download.error.title"), tr("download.error.incomplete"))
                 return
 
         try:
             mod_name = item_data.get('_sName', 'Unknown Mod')
             if not item_data.get('_aFiles'):
-                QMessageBox.information(self, "No Files Found", "Could not find any downloadable files for this mod.")
+                QMessageBox.information(self, tr("download.no_files.title"), tr("download.no_files.body"))
                 return
 
             # Pause background image loading while the modal dialog is open to prevent crashes.
@@ -1080,7 +1186,7 @@ class CrossPatchWindow(QMainWindow):
                 print("[DEBUG] Resuming background tasks after closing file dialog.")
                 self.fetch_browse_mods(page=self.browse_current_page)
         except Exception as e:
-            QMessageBox.critical(self, "Download Error", f"An error occurred.\n\n{e}")
+            QMessageBox.critical(self, tr("download.error.title"), tr("download.error.body", error=e))
 
     def start_download_from_selection(self, selected_file, full_item_data):
         """Starts the download after the FileSelectDialog has closed."""
@@ -1106,7 +1212,7 @@ class CrossPatchWindow(QMainWindow):
                 with open(os.path.join(mod_folder, "info.json"), "w", encoding="utf-8") as f:
                     json.dump(new_data, f, indent=2)
             except Exception as e:
-                QMessageBox.critical(self, "Save Error", f"Could not save info.json:\n{e}")
+                QMessageBox.critical(self, tr("editmod.save_error.title"), tr("editmod.save_error.body", error=e))
                 return
 
             active_profile = self.profile_manager.get_active_profile()
@@ -1136,7 +1242,7 @@ class CrossPatchWindow(QMainWindow):
         # Discover the configuration from the file system
         config_data = Util.discover_mod_configuration(mod_path)
         if not config_data:
-            QMessageBox.information(self, "No Configuration", "This mod is not set up for file-based configuration.")
+            QMessageBox.information(self, tr("modconfig.none.title"), tr("modconfig.none.body"))
             return
 
         active_profile = self.profile_manager.get_active_profile()
@@ -1163,7 +1269,7 @@ class CrossPatchWindow(QMainWindow):
             mod_name_from_gb = item_data.get('_sName', 'Unknown Mod')
 
             if not item_data.get('_aFiles'):
-                QMessageBox.information(self, "No Files Found", "Could not find any downloadable files for this mod.")
+                QMessageBox.information(self, tr("download.no_files.title"), tr("download.no_files.body"))
                 return
 
             dialog = FileSelectDialog(self, item_data)
@@ -1178,7 +1284,7 @@ class CrossPatchWindow(QMainWindow):
                 print("User cancelled file selection for update.")
 
         except Exception as e:
-            QMessageBox.critical(self, "Update Error", f"Could not get mod details or start update.\n\n{e}")
+            QMessageBox.critical(self, tr("modupdate.error.title"), tr("modupdate.error.body", error=e))
 
     def check_all_mod_updates(self, manual_check=False):
         print("Checking all mods for updates...")
@@ -1225,14 +1331,14 @@ class CrossPatchWindow(QMainWindow):
             # If this was a manual check, still notify the user even if nothing changed.
             if manual_check:
                 if updates:
-                    QMessageBox.information(self, "Updates Found", f"{len(updates)} mod(s) have updates available and are now highlighted.")
+                    QMessageBox.information(self, tr("modupdate.found.title"), tr("modupdate.found.body", count=len(updates)))
                 else:
-                    QMessageBox.information(self, "Update Check", "No mod updates available.")
+                    QMessageBox.information(self, tr("modupdate.none.title"), tr("modupdate.none.body"))
 
         # If it was a manual check and there were updates, we may still need to
         # inform the user even if the internal mapping hasn't changed (edge cases).
         if manual_check and updates and updates != self.updatable_mods:
-            QMessageBox.information(self, "Updates Found", f"{len(updates)} mod(s) have updates available and are now highlighted.")
+            QMessageBox.information(self, tr("modupdate.found.title"), tr("modupdate.found.body", count=len(updates)))
 
         print("Mod update check finished.")
 
@@ -1250,13 +1356,13 @@ class CrossPatchWindow(QMainWindow):
 
         mod_page = mod_info.get("mod_page")
         if not mod_page or not mod_page.startswith("https://gamebanana.com"):
-            QMessageBox.information(self, "Update Check", "This mod does not have a GameBanana page set in its info.json.")
+            QMessageBox.information(self, tr("modupdate.none.title"), tr("modupdate.nopage.body"))
             return
 
         try:
             gb_version = Util.get_gb_mod_version(mod_page)
             if not gb_version:
-                QMessageBox.warning(self, "Update Check", "Could not find version information for this mod on GameBanana.")
+                QMessageBox.warning(self, tr("modupdate.none.title"), tr("modupdate.noversion.body"))
                 return
 
             local_version = mod_info.get("version", "1.0")
@@ -1266,17 +1372,17 @@ class CrossPatchWindow(QMainWindow):
                 if dialog.exec():
                     self.update_mod_from_url(mod_page, mod_folder)
             else:
-                QMessageBox.information(self, "No Updates Found", f"'{display_name}' is already up to date (v{local_version}).")
+                QMessageBox.information(self, tr("modupdate.uptodate.title"), tr("modupdate.uptodate.body", name=display_name, version=local_version))
 
         except Exception as e:
-            QMessageBox.critical(self, "Update Check Error", f"Failed to check for updates: {str(e)}")
+            QMessageBox.critical(self, tr("modupdate.check_failed.title"), tr("modupdate.check_failed.body", error=e))
 
     def delete_mod(self):
         selected = self.tree.currentItem()
         if not selected: return
 
         mod_id = selected.data(0, Qt.UserRole)
-        reply = QMessageBox.question(self, "Confirm Delete", f"Are you sure you want to delete '{selected.text(2)}'?",
+        reply = QMessageBox.question(self, tr("mods.delete.title"), tr("mods.delete.body", name=selected.text(2)),
                                      QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
 
         if reply == QMessageBox.Yes:
@@ -1295,8 +1401,7 @@ class CrossPatchWindow(QMainWindow):
         if os.path.isdir(folder):
             QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
         else:
-            QMessageBox.warning(self, "Folder Not Found",
-                                f"The folder for this mod could not be found at the expected location:\n\n{folder}")
+            QMessageBox.warning(self, tr("mods.folder_missing.title"), tr("mods.folder_missing.body", path=folder))
 
     def detect_mod_conflicts(self):
         mods_folder = self.cfg["mods_folder"]
@@ -1351,10 +1456,22 @@ class CrossPatchWindow(QMainWindow):
                 item_data = Util.get_gb_item_data_from_url(gb_url)
                 dialog = OneClickInstallDialog(self, item_data)
                 if dialog.exec():
-                    self.active_download_manager = DownloadManager(self, self.cfg["mods_folder"], on_complete=self.refresh)
-                    self.active_download_manager.download_from_schema(gb_url) # Should be schema download
+                    # This link carries only the page URL, so let the user pick
+                    # the file. (The previous call passed a single argument to
+                    # download_from_schema, which needs four, and always raised
+                    # a TypeError before anything was downloaded.)
+                    if not item_data.get('_aFiles'):
+                        QMessageBox.information(self, tr("download.no_files.title"), tr("download.no_files.body"))
+                        return
+
+                    file_dialog = FileSelectDialog(self, item_data)
+                    if file_dialog.exec():
+                        selected_file = file_dialog.get_selection()
+                        if selected_file:
+                            self.active_download_manager = DownloadManager(self, self.cfg["mods_folder"], on_complete=self.refresh)
+                            self.active_download_manager.download_specific_file(selected_file, item_data)
         except Exception as e:
-            QMessageBox.critical(self, "Download Error", f"Could not parse the received URL.\n\nDetails: {e}")
+            QMessageBox.critical(self, tr("protocol.error.title"), tr("protocol.error.body", error=e))
 
     def _socket_listener(self):
         self.instance_socket.listen(1)
@@ -1397,11 +1514,16 @@ class CrossPatchWindow(QMainWindow):
             Config.hide_console()
 
     def on_change_mods_folder(self):
-        new_folder = QFileDialog.getExistingDirectory(self, "Select a folder to store your mods", self.cfg["mods_folder"])
+        new_folder = QFileDialog.getExistingDirectory(self, "Select a folder to store your mods", self.cfg.get("mods_folder", ""))
         if new_folder:
+            if not Config.ensure_mods_folder(new_folder):
+                QMessageBox.warning(self, tr("modsfolder.unavailable.title"), tr("modsfolder.rejected.body", path=new_folder))
+                return
             self.mods_folder_var.setText(new_folder)
             self.cfg["mods_folder"] = new_folder
             Config.save_config(self.cfg)
+            # Pick up whatever is already sitting in the newly selected folder.
+            self._sync_priority_with_disk()
             self.save_and_apply_mods()
 
     def on_change_game_root(self):
@@ -1428,38 +1550,38 @@ class CrossPatchWindow(QMainWindow):
             self.save_and_apply_mods()
 
     def add_profile(self):
-        new_name, ok = QInputDialog.getText(self, "New Profile", "Enter a name for the new profile:")
+        new_name, ok = QInputDialog.getText(self, tr("profile.new.title"), tr("profile.new.prompt"))
         if ok and new_name:
             if self.profile_manager.create_profile(new_name):
                 self.update_profile_selector()
                 self.refresh()
             else:
-                QMessageBox.critical(self, "Error", "A profile with this name already exists or the name is invalid.")
+                QMessageBox.critical(self, tr("common.error"), tr("profile.error.exists"))
 
     def rename_profile(self):
         old_name = self.profile_manager.get_active_profile_name()
         if old_name == self.profile_manager.DEFAULT_PROFILE_NAME:
-            QMessageBox.critical(self, "Error", "The 'Default' profile cannot be renamed.")
+            QMessageBox.critical(self, tr("common.error"), tr("profile.error.default_rename"))
             return
 
-        new_name, ok = QInputDialog.getText(self, "Rename Profile", f"Enter a new name for '{old_name}':", text=old_name)
+        new_name, ok = QInputDialog.getText(self, tr("profile.rename.title"), tr("profile.rename.prompt", name=old_name), text=old_name)
         if ok and new_name and new_name != old_name:
             if self.profile_manager.rename_profile(old_name, new_name):
                 self.update_profile_selector()
             else:
-                QMessageBox.critical(self, "Error", "A profile with this name already exists or the name is invalid.")
+                QMessageBox.critical(self, tr("common.error"), tr("profile.error.exists"))
 
     def delete_profile(self):
         profile_to_delete = self.profile_manager.get_active_profile_name()
 
         if profile_to_delete == self.profile_manager.DEFAULT_PROFILE_NAME:
-            QMessageBox.critical(self, "Error", "The 'Default' profile cannot be deleted.")
+            QMessageBox.critical(self, tr("common.error"), tr("profile.error.default_delete"))
             return
         if len(self.profile_manager.get_profile_names()) <= 1:
-            QMessageBox.critical(self, "Error", "You cannot delete the last profile.")
+            QMessageBox.critical(self, tr("common.error"), tr("profile.error.last"))
             return
 
-        reply = QMessageBox.question(self, "Confirm Delete", f"Are you sure you want to delete the active profile '{profile_to_delete}'?",
+        reply = QMessageBox.question(self, tr("profile.delete.title"), tr("profile.delete.body", name=profile_to_delete),
                                      QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
 
         if reply == QMessageBox.Yes:
@@ -1471,7 +1593,7 @@ class CrossPatchWindow(QMainWindow):
 
     def _on_browse_tab_selected(self, index):
         """Fetch initial mod data only when the 'Browse Mods' tab is selected for the first time."""
-        if self.notebook.tabText(index) == "Browse Mods" and not self.browse_mods_data:
+        if index == self.TAB_BROWSE and not self.browse_mods_data:
             self.fetch_browse_mods()
 
     def fetch_browse_mods(self, page=1):
@@ -1479,12 +1601,12 @@ class CrossPatchWindow(QMainWindow):
         print(f"[DEBUG] fetch_browse_mods called with page={page}")
         # Clear existing cards and show loading message
         self._clear_card_layout()
-        loading_label = QLabel("<h2>Loading...</h2>")
+        loading_label = QLabel(f'<h2>{tr("browse.loading")}</h2>')
         loading_label.setAlignment(Qt.AlignCenter)
         self.card_layout.addWidget(loading_label, 0, 0, 1, 4)
 
         self.browse_current_page = page
-        self.browse_page_label.setText(f"Page {self.browse_current_page}")
+        self.browse_page_label.setText(tr("browse.page", page=self.browse_current_page))
         self.browse_prev_btn.setEnabled(page > 1)
 
         search_query = self.browse_search_entry.text().strip()
@@ -1506,15 +1628,23 @@ class CrossPatchWindow(QMainWindow):
 
             # Search overrides all other filters and uses the Subfeed endpoint.
             if search:
-                mods, metadata = Util.get_gb_mod_list(game_id, 'default', page, search, None)
+                mods, metadata, approximate = Util.search_gb_mods(game_id, search, page)
+                metadata = dict(metadata or {})
+                metadata['_bApproximate'] = approximate
+                metadata['_sQuery'] = search
             else:
                 mods, metadata = Util.fetch_specialized_lists(game_id, sort, page)
 
             QApplication.instance().postEvent(self, Util.ModListFetchEvent((mods, metadata)))
         except Exception as e:
-            error_message = f"Failed to fetch mods: {e}"
+            error_message = tr("browse.fetch_failed", error=e)
             print(error_message)
             QApplication.instance().postEvent(self, Util.ModListFetchEvent(([error_message], {})))
+
+    def _set_browse_notice(self, text):
+        """Shows or hides the "closest matches" banner above the mod cards."""
+        self.browse_notice_label.setText(text)
+        self.browse_notice_label.setVisible(bool(text))
 
     def _clear_card_layout(self):
         """Removes all widgets from the card layout, ensuring threads are stopped."""
@@ -1536,7 +1666,8 @@ class CrossPatchWindow(QMainWindow):
         self.browse_next_btn.setEnabled(not metadata.get('_bIsComplete', True))
 
         if not mods or (isinstance(mods, list) and len(mods) > 0 and isinstance(mods[0], str)):
-            error_message = mods[0] if mods else "No mods found."
+            self._set_browse_notice("")
+            error_message = mods[0] if mods else tr("browse.none")
             print(f"[DEBUG] No mods found or error received. Displaying: '{error_message}'")
             error_label = QLabel(f"<h2>{error_message}</h2>")
             error_label.setAlignment(Qt.AlignCenter)
@@ -1544,6 +1675,12 @@ class CrossPatchWindow(QMainWindow):
             return
 
         print(f"[DEBUG] Populating browse tree with {len(mods)} mods.")
+        # GameBanana matches names literally, so we tell the user when what
+        # they see is the closest thing found rather than an exact match.
+        if metadata.get('_bApproximate'):
+            self._set_browse_notice(tr("browse.approximate", query=metadata.get('_sQuery', '')))
+        else:
+            self._set_browse_notice("")
         self.browse_mods_data = mods
 
         # Determine number of columns based on window width
@@ -1556,7 +1693,7 @@ class CrossPatchWindow(QMainWindow):
     def _reflow_browse_cards(self):
         """Rearranges existing mod cards to fit the new window size without fetching new data."""
         # Only reflow if the browse tab is visible and has cards.
-        if self.notebook.tabText(self.notebook.currentIndex()) != "Browse Mods" or self.card_layout.count() == 0:
+        if self.notebook.currentIndex() != self.TAB_BROWSE or self.card_layout.count() == 0:
             return
 
         # Check if the first item is a label (e.g., "Loading...", "No mods found.")

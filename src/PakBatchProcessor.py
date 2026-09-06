@@ -5,9 +5,10 @@ import os
 import shutil
 import re
 import threading 
-from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel, QProgressBar
+from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel, QProgressBar, QMessageBox
 from PySide6.QtCore import Qt, Signal, QObject
 import PakInspector
+from Localization import tr
 from ConflictDialog import ConflictDialog
 
 class BatchProcessSignals(QObject):
@@ -27,7 +28,7 @@ class BatchProgressDialog(QDialog):
         self.setModal(True)
         layout = QVBoxLayout(self)
         
-        self.status_label = QLabel("Starting...")
+        self.status_label = QLabel(tr("batch.starting"))
         layout.addWidget(self.status_label)
         
         self.progress_bar = QProgressBar()
@@ -66,7 +67,7 @@ class PakBatchProcessor:
             mod_list: List of dictionaries containing mod info with format:
                      [{"name": str, "enabled": bool, "priority": int}, ...]
         """
-        dialog = BatchProgressDialog(parent_window, "Processing Mods")
+        dialog = BatchProgressDialog(parent_window, tr("batch.title"))
 
         def worker():
             try:
@@ -88,7 +89,7 @@ class PakBatchProcessor:
                     
                     try:
                         progress = int((i / total_mods) * 100)
-                        status = f"{'Enabling' if is_enabled else 'Disabling'} {mod_name}..."
+                        status = tr("batch.enabling" if is_enabled else "batch.disabling", name=mod_name)
                         self.signals.progress.emit(progress)
                         self.signals.progress_text.emit(status)
 
@@ -109,7 +110,7 @@ class PakBatchProcessor:
                 if all_conflicts:
                     self.signals.conflicts_found.emit({k: list(v) for k, v in all_conflicts.items()})
                 self.signals.progress.emit(100)
-                self.signals.progress_text.emit("Operation complete")
+                self.signals.progress_text.emit(tr("batch.complete"))
                 self.signals.finished.emit(results)
 
             except Exception as e:
@@ -122,9 +123,27 @@ class PakBatchProcessor:
         
         # Connect the new conflicts signal to a handler that can show the dialog
         def show_conflict_dialog(conflicts):
-            ConflictDialog(parent_window, "Multiple Mods", conflicts).exec()
+            ConflictDialog(parent_window, tr("conflict.multiple_mods"), conflicts).exec()
         self.signals.conflicts_found.connect(show_conflict_dialog)
         self.signals.error.connect(dialog.accept)
+
+        # Failures used to be collected and then thrown away: the dialog simply
+        # closed and the mods were silently missing from the game.
+        def report_error(message):
+            QMessageBox.critical(parent_window, tr("batch.failed.title"), message)
+        self.signals.error.connect(report_error)
+
+        def report_failed_mods(results):
+            failed = results.get("failed") or []
+            if not failed:
+                return
+            details = "\n".join(f"- {f['name']}: {f['error']}" for f in failed)
+            QMessageBox.warning(
+                parent_window,
+                tr("batch.partial.title"),
+                tr("batch.partial.body", count=len(failed), details=details),
+            )
+        self.signals.finished.connect(report_failed_mods)
 
         # Start worker thread
         self._cancel_flag = False
@@ -136,8 +155,13 @@ class PakBatchProcessor:
 
     def _get_pak_dst(self) -> str:
         """Get the destination path for pak files."""
+        # Without a game_root the join below yields a relative path, which used
+        # to create a stray "UNION" tree wherever CrossPatch was started from.
+        game_root = self.cfg.get("game_root")
+        if not game_root:
+            raise ValueError(tr("error.game_folder_unset"))
         return os.path.join(
-            self.cfg["game_root"],
+            game_root,
             "UNION",
             "Content",
             "Paks",
@@ -252,7 +276,7 @@ class PakBatchProcessor:
         Removes all CrossPatch-managed mod folders from the game's mod directory.
         This is the primary cleanup mechanism.
         """
-        self.signals.progress_text.emit("Cleaning game's mod directory...")
+        self.signals.progress_text.emit(tr("batch.cleaning"))
         if not os.path.isdir(pak_dst):
             return
 

@@ -15,6 +15,7 @@ CrossPatch is an easy to use mod manager for Sonic Racing: Crossworlds
 - Simple, Clean, and easy to use UI
 - Ability to launch the game via CrossPatch
 - Functions on both Windows and Linux
+- English and French interface, picked automatically from your system language
 
 ### Archive Support
 CrossPatch supports extracting `.zip`, `.7z`, and `.rar` archives.
@@ -26,6 +27,43 @@ For `.7z` and `.rar` support, you may need to install additional tools:
   - **Alternative (System-wide)**: If the bundled tool is not found, CrossPatch will look for `unrar` in your system's PATH.
     - **Windows**: Install WinRAR and ensure its folder is in your PATH.
     - **Linux**: Install the `unrar` package via your distribution's package manager (e.g., `sudo apt install unrar` or `sudo dnf install unrar`).
+
+### Where your mods are stored
+
+On first launch CrossPatch offers a default folder and creates it for you:
+
+- **Windows**: `%APPDATA%\CrossPatch\mods`
+- **Linux**: `~/.config/CrossPatch/mods`
+
+You can pick a different one from that dialog, or later under **Settings > Mods Folder**.
+This is *not* your game's `~mods` folder — CrossPatch copies the enabled mods into the
+game itself when you apply or launch.
+
+If you set `CROSSPATCH_PORTABLE=1`, the mods folder is `mods/` next to the executable instead.
+
+### Languages
+
+CrossPatch ships in **English** and **French**. On first launch it follows your
+system language: a French Windows starts in French, anything else falls back to
+English. You can force a language under **Settings > Language**; the change
+applies after a restart.
+
+**Adding your own language**
+
+1. Copy `assets/locales/en.json`.
+2. Rename it to your language code: `de.json`, `es.json`, `pt_BR.json`...
+3. Translate the values (leave the keys on the left alone) and set `_meta.name`
+   to the language's own name - that is what the picker displays.
+4. Drop it in:
+   - Windows: `%APPDATA%\CrossPatch\locales\`
+   - Linux: `~/.config/CrossPatch/locales/`
+
+Restart CrossPatch and your language appears in the list. Files in that folder
+override the bundled ones, so you can also fix a wording in `fr.json` without
+touching the install - and it survives updates. Any key you leave out falls back
+to English, so a partial translation works fine.
+
+Pull requests adding a language to `assets/locales/` are welcome.
 
 ## Misc Info
 

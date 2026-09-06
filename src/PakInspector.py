@@ -1,23 +1,75 @@
 import os
+import sys
 import json
 import subprocess
 from typing import Dict, Optional, List
 
+# Where the parser can live, relative to a base directory. The executable has
+# no extension on Linux/macOS.
+_PARSER_RELATIVE_PATHS = [
+    ("tools", "CrossPatchParser", "bin", "Release", "net8.0", "publish", "CrossPatchParser.exe"),
+    ("tools", "CrossPatchParser", "bin", "Release", "net8.0", "CrossPatchParser.exe"),
+    ("tools", "CrossPatchParser", "bin", "Release", "net7.0", "publish", "CrossPatchParser.exe"),
+    ("tools", "CrossPatchParser", "bin", "Release", "net7.0", "CrossPatchParser.exe"),
+    ("tools", "CrossPatchParser", "bin", "Release", "net8.0", "publish", "CrossPatchParser"),
+    ("tools", "CrossPatchParser", "bin", "Release", "net8.0", "CrossPatchParser"),
+    # A packaged build usually ships the parser next to the executable.
+    ("tools", "CrossPatchParser.exe"),
+    ("tools", "CrossPatchParser"),
+    ("CrossPatchParser.exe",),
+    ("CrossPatchParser",),
+    # Framework-dependent (dll) locations - run via `dotnet <dll>` if found
+    ("tools", "CrossPatchParser", "bin", "Release", "net8.0", "publish", "CrossPatchParser.dll"),
+    ("tools", "CrossPatchParser", "bin", "Release", "net8.0", "CrossPatchParser.dll"),
+    ("tools", "CrossPatchParser", "bin", "Release", "net7.0", "publish", "CrossPatchParser.dll"),
+    ("tools", "CrossPatchParser", "bin", "Release", "net7.0", "CrossPatchParser.dll"),
+    ("tools", "CrossPatchParser.dll"),
+    ("CrossPatchParser.dll",),
+]
+
+
+def _parser_base_dirs() -> List[str]:
+    """Directories the parser is searched in.
+
+    Resolving only against __file__ broke packaged builds: PyInstaller and
+    Nuitka unpack the sources somewhere temporary, so the bundled parser was
+    never found and the app claimed the .NET 8 runtime was missing.
+    """
+    bases = []
+
+    if getattr(sys, "frozen", False):
+        bases.append(os.path.dirname(os.path.abspath(sys.executable)))
+    if hasattr(sys, "_MEIPASS"):
+        bases.append(sys._MEIPASS)
+    try:
+        bases.append(os.path.dirname(os.path.abspath(sys.argv[0])))
+    except Exception:
+        pass
+    try:
+        module_dir = os.path.dirname(os.path.abspath(__file__))
+        bases.append(module_dir)
+        bases.append(os.path.dirname(module_dir))
+    except NameError:
+        pass
+    bases.append(os.getcwd())
+
+    seen = set()
+    return [b for b in bases if b and not (b in seen or seen.add(b))]
+
+
+def _subprocess_flags() -> Dict:
+    """Keeps a console window from flashing when the GUI runs the parser."""
+    if os.name == "nt":
+        return {"creationflags": 0x08000000}  # CREATE_NO_WINDOW
+    return {}
+
 
 def _possible_parser_paths() -> List[str]:
-    base = os.path.dirname(os.path.dirname(__file__))
-    return [
-        os.path.join(base, "tools", "CrossPatchParser", "bin", "Release", "net8.0", "publish", "CrossPatchParser.exe"),
-        os.path.join(base, "tools", "CrossPatchParser", "bin", "Release", "net8.0", "CrossPatchParser.exe"),
-        os.path.join(base, "tools", "CrossPatchParser", "bin", "Release", "net7.0", "publish", "CrossPatchParser.exe"),
-        os.path.join(base, "tools", "CrossPatchParser", "bin", "Release", "net7.0", "CrossPatchParser.exe"),
-        os.path.join(base, "tools", "CrossPatchParser", "bin", "Release", "net8.0", "publish", "CrossPatchParser"),
-        # Framework-dependent (dll) locations - run via `dotnet <dll>` if found
-        os.path.join(base, "tools", "CrossPatchParser", "bin", "Release", "net8.0", "publish", "CrossPatchParser.dll"),
-        os.path.join(base, "tools", "CrossPatchParser", "bin", "Release", "net8.0", "CrossPatchParser.dll"),
-        os.path.join(base, "tools", "CrossPatchParser", "bin", "Release", "net7.0", "publish", "CrossPatchParser.dll"),
-        os.path.join(base, "tools", "CrossPatchParser", "bin", "Release", "net7.0", "CrossPatchParser.dll"),
-    ]
+    paths = []
+    for base in _parser_base_dirs():
+        for parts in _PARSER_RELATIVE_PATHS:
+            paths.append(os.path.join(base, *parts))
+    return paths
 
 
 def run_parser(mod_path: str, name: Optional[str] = None, author: Optional[str] = None,
@@ -40,12 +92,10 @@ def run_parser(mod_path: str, name: Optional[str] = None, author: Optional[str] 
     Returns:
         Dict containing the parsed information
     """
-    possible_paths = _possible_parser_paths()
-    parser_path = None
-    for p in possible_paths:
-        if os.path.exists(p):
-            parser_path = p
-            break
+    # Honour a caller-supplied path; only search when none was given.
+    # isfile, not exists: 'tools/CrossPatchParser' is also a directory name.
+    if not parser_path or not os.path.isfile(parser_path):
+        parser_path = next((p for p in _possible_parser_paths() if os.path.isfile(p)), None)
 
     if not parser_path:
         raise FileNotFoundError(
@@ -72,7 +122,8 @@ def run_parser(mod_path: str, name: Optional[str] = None, author: Optional[str] 
     try:
         # Prevent hangs by adding a timeout (seconds). 30s is a reasonable default
         # for analyzing a small set of pak files; adjust if needed.
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30,
+                                **_subprocess_flags())
         out = result.stdout.strip()
         if not out:
             # If stdout is empty, include stderr for diagnostics
@@ -96,7 +147,8 @@ def self_contained_parser_available() -> bool:
     for p in _possible_parser_paths():
         if p.lower().endswith('.dll'):
             continue
-        if os.path.exists(p):
+        # isfile, not exists: 'tools/CrossPatchParser' is also a directory name.
+        if os.path.isfile(p):
             # On POSIX, ensure the file is executable
             try:
                 if os.name == 'posix':
@@ -109,6 +161,33 @@ def self_contained_parser_available() -> bool:
                 # If access check fails, fall back to existence
                 return True
     return False
+
+def parser_works(timeout: int = 20) -> bool:
+    """Checks that the bundled parser actually starts on this machine.
+
+    Existence is not enough. The parser we ship is framework-dependent: it is
+    a normal .exe, so it looks available, but it still needs the shared .NET
+    runtime and fails at the first pak analysis without it. Asking it to run
+    is the only honest answer, and this is only called when dotnet was not
+    found anyway.
+    """
+    parser_path = next((p for p in _possible_parser_paths() if os.path.isfile(p)), None)
+    if not parser_path:
+        return False
+
+    if parser_path.lower().endswith('.dll'):
+        cmd = ["dotnet", parser_path, "--help"]
+    else:
+        cmd = [parser_path, "--help"]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                                **_subprocess_flags())
+        return result.returncode == 0
+    except Exception as e:
+        print(f"The pak parser is present but will not run: {e}")
+        return False
+
 
 def generate_mod_pak_manifest(mod_path: str) -> Dict:
     """

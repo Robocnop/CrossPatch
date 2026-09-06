@@ -12,6 +12,7 @@ from PySide6.QtCore import Signal, QObject, Qt
 
 from Constants import APP_VERSION 
 from Config import is_packaged
+from Localization import tr
 import Util
 
 class UpdaterSignals(QObject):
@@ -32,7 +33,7 @@ class ProgressDialog(QDialog):
         self.setWindowFlag(Qt.WindowCloseButtonHint, False)
 
         layout = QVBoxLayout(self)
-        self.label = QLabel("Initializing...")
+        self.label = QLabel(tr("updater.initializing"))
         layout.addWidget(self.label)
 
         self.progress_bar = QProgressBar()
@@ -59,7 +60,7 @@ class Updater:
     def start_update(self):
         """Starts the update process in a new thread."""
         # Show the dialog immediately and start a thread to find the asset URL.
-        self.progress_dialog = ProgressDialog(self.parent, "Updating CrossPatch...")
+        self.progress_dialog = ProgressDialog(self.parent, tr("updater.title"))
         self.signals.progress.connect(self.progress_dialog.update_progress)
         self.signals.label_text.connect(self.progress_dialog.update_label)
         threading.Thread(target=self._find_asset_and_request_download, daemon=True).start()
@@ -76,15 +77,15 @@ class Updater:
     def _on_error(self, error_message):
         if self.progress_dialog:
             self.progress_dialog.reject()
-        QMessageBox.critical(self.parent, "Update Failed", f"An error occurred during the update process:\n\n{error_message}")
+        QMessageBox.critical(self.parent, tr("updater.failed.title"), tr("updater.failed.body", error=error_message))
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def _find_asset_and_request_download(self):
         try:
-            self.signals.label_text.emit("Finding release asset...")
+            self.signals.label_text.emit(tr("updater.finding_asset"))
             asset = self._find_release_asset()
             if not asset:
-                raise ValueError("Could not find a suitable release package for this OS.")
+                raise ValueError(tr("updater.no_asset"))
 
             download_url = asset['browser_download_url']
             archive_path = os.path.join(self.temp_dir, asset['name'])
@@ -96,13 +97,13 @@ class Updater:
 
     def _download_and_install_thread(self, url, archive_path):
         try:
-            self.signals.label_text.emit(f"Downloading {os.path.basename(archive_path)}...")
+            self.signals.label_text.emit(tr("updater.downloading", name=os.path.basename(archive_path)))
             self._download_file_with_progress(url, archive_path)
 
             extract_path = os.path.join(self.temp_dir, 'extracted')
             self._extract_archive(archive_path, extract_path, self.signals.label_text)
 
-            self.signals.label_text.emit("Finalizing...")
+            self.signals.label_text.emit(tr("updater.finalizing"))
             self._run_updater_script(extract_path)
             self.signals.finished.emit()
 
@@ -212,7 +213,7 @@ rm -rf "{self.temp_dir}"
         archive_format = os.path.splitext(archive_path)[1].lower()
         print(f"Detected archive format: {archive_format}")
 
-        if progress_signal: progress_signal.emit("Extracting...")
+        if progress_signal: progress_signal.emit(tr("updater.extracting"))
 
         if archive_format == '.zip':
             import zipfile

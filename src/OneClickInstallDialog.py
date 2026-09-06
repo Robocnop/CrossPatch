@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtGui import QPixmap, QImage, QFont
 from PySide6.QtCore import Qt, Signal, QObject
+from Localization import tr
 
 class ImageLoader(QObject):
     """Worker object to load an image in a separate thread."""
@@ -30,7 +31,7 @@ class ImageLoader(QObject):
             self.image_loaded.emit(pixmap)
         except Exception as e:
             print(f"Failed to load image for dialog: {e}")
-            self.image_failed.emit("Failed to load image.")
+            self.image_failed.emit(tr("fileselect.image_failed"))
 
 class OneClickInstallDialog(QDialog):
     def __init__(self, parent, item_data):
@@ -39,13 +40,13 @@ class OneClickInstallDialog(QDialog):
         self.item_data = item_data
         mod_name = self.item_data.get('_sName', 'Unknown Mod')
 
-        self.setWindowTitle("Confirm Download")
+        self.setWindowTitle(tr("oneclick.title"))
         self.setModal(True)
 
         main_layout = QVBoxLayout(self)
 
         # --- Image ---
-        self.image_label = QLabel("Loading image...")
+        self.image_label = QLabel(tr("fileselect.loading_image"))
         self.image_label.setFixedSize(360, 180)
         self.image_label.setAlignment(Qt.AlignCenter)
         main_layout.addWidget(self.image_label)
@@ -61,7 +62,7 @@ class OneClickInstallDialog(QDialog):
         main_layout.addWidget(name_label)
 
         # --- Confirmation Text ---
-        confirm_text = QLabel("Do you want to download this mod?")
+        confirm_text = QLabel(tr("oneclick.confirm"))
         confirm_text.setAlignment(Qt.AlignCenter)
         main_layout.addWidget(confirm_text)
 
@@ -86,13 +87,13 @@ class OneClickInstallDialog(QDialog):
         preview_media = self.item_data.get('_aPreviewMedia', {})
         images = preview_media.get('_aImages', [])
         if not images:
-            self.on_image_failed("No preview image.")
+            self.on_image_failed(tr("fileselect.no_preview"))
             return
 
         base_url = images[0].get('_sBaseUrl')
         file_url = images[0].get('_sFile')
         if not base_url or not file_url:
-            self.on_image_failed("Invalid image URL.")
+            self.on_image_failed(tr("fileselect.invalid_image"))
             return
 
         image_url = f"{base_url}/{file_url}"

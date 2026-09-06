@@ -4,6 +4,7 @@ from PySide6.QtWidgets import (
     QFormLayout, QWidget, QScrollArea, QSizePolicy, QGroupBox, QTextEdit
 )
 from PySide6.QtCore import Qt
+from Localization import tr
 
 class ModConfigDialog(QDialog):
     """
@@ -17,7 +18,7 @@ class ModConfigDialog(QDialog):
         self.current_selections = current_selections.copy() # Make a mutable copy
         self.widgets = {}
 
-        self.setWindowTitle(f"Configure '{self.mod_name}'")
+        self.setWindowTitle(tr("modconfig.title", name=self.mod_name))
         self.setMinimumWidth(600)
         self.setMinimumHeight(500)
 
@@ -37,7 +38,7 @@ class ModConfigDialog(QDialog):
             group_layout = QVBoxLayout(group_box)
 
             combo_box = QComboBox()
-            desc_label = QLabel("Select an option to see its description.")
+            desc_label = QLabel(tr("modconfig.select_hint"))
             desc_label.setWordWrap(True)
             desc_label.setStyleSheet("color: #cccccc; padding: 5px; border-radius: 3px; background-color: #2a2a2a;")
             desc_label.setMinimumHeight(60)
@@ -45,7 +46,7 @@ class ModConfigDialog(QDialog):
 
             for option_folder, option_details in options.items():
                 display_name = option_details.get('name', option_folder)
-                description = option_details.get('description', 'No description.')
+                description = option_details.get('description') or tr("modconfig.no_description")
                 combo_box.addItem(display_name, userData=option_folder)
                 combo_box.setItemData(combo_box.count() - 1, description, Qt.UserRole + 1)
 

@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtGui import QPixmap, QImage, QFont
 from PySide6.QtCore import Qt, Signal, QObject
+from Localization import tr
 
 class ImageLoader(QObject):
     """Worker object to load an image in a separate thread."""
@@ -36,7 +37,7 @@ class FileSelectDialog(QDialog):
         )
         self.result = None
 
-        self.setWindowTitle(f"Download Options for '{self.mod_name}'")
+        self.setWindowTitle(tr("fileselect.title", name=self.mod_name))
         self.resize(1100, 600)
 
         # --- Main Layout ---
@@ -50,14 +51,14 @@ class FileSelectDialog(QDialog):
         left_layout = QVBoxLayout(left_pane)
         splitter.addWidget(left_pane)
 
-        self.image_label = QLabel("Loading image...")
+        self.image_label = QLabel(tr("fileselect.loading_image"))
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setFixedHeight(200)
         left_layout.addWidget(self.image_label)
 
-        desc_label = QLabel("<b>Description</b>")
+        desc_label = QLabel(tr("fileselect.description"))
         left_layout.addWidget(desc_label)
-        description = self.item_data.get('_sDescription', 'No description available.')
+        description = self.item_data.get('_sDescription') or tr("fileselect.no_description")
         desc_browser = QTextBrowser()
         desc_browser.setHtml(description)
         # Set a maximum height to keep the description area concise
@@ -65,12 +66,12 @@ class FileSelectDialog(QDialog):
         desc_browser.setFixedHeight(doc_height + 5) # Add a small margin
         left_layout.addWidget(desc_browser)
 
-        body_label = QLabel("<b>Readme</b>")
+        body_label = QLabel(tr("fileselect.readme"))
         left_layout.addWidget(body_label)
         
         body_text = QTextBrowser()
         body_text.setOpenExternalLinks(True)
-        body_content = self.item_data.get('_sText', 'No readme content available.')
+        body_content = self.item_data.get('_sText') or tr("fileselect.no_readme")
         body_text.setHtml(body_content)
         left_layout.addWidget(body_text)
 
@@ -85,7 +86,9 @@ class FileSelectDialog(QDialog):
 
         self.tree = QTreeWidget()
         self.tree.setColumnCount(6)
-        self.tree.setHeaderLabels(["", "File Name", "Version", "Size", "Date Added", "Description"])
+        self.tree.setHeaderLabels(["", tr("fileselect.col.file"), tr("fileselect.col.version"),
+                                   tr("fileselect.col.size"), tr("fileselect.col.date"),
+                                   tr("fileselect.col.description")])
         header = self.tree.header()
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents) # Radio button column
         header.setSectionResizeMode(1, QHeaderView.Stretch)          # File Name
@@ -97,12 +100,12 @@ class FileSelectDialog(QDialog):
         self.tree.setSelectionMode(QTreeWidget.NoSelection) # We use checkboxes for selection
 
         for i, file_info in enumerate(self.files_data):
-            file_name = file_info.get('_sFile', 'N/A')
+            file_name = file_info.get('_sFile', tr("common.na"))
             file_version = file_info.get('_sVersion', '')
             file_size_bytes = file_info.get('_nFilesize', 0)
-            file_size_mb = f"{file_size_bytes / (1024*1024):.2f} MB" if file_size_bytes > 0 else "N/A"
+            file_size_mb = f"{file_size_bytes / (1024*1024):.2f} MB" if file_size_bytes > 0 else tr("common.na")
             timestamp = file_info.get('_tsDateAdded', 0)
-            date_added = datetime.datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M') if timestamp > 0 else "N/A"
+            date_added = datetime.datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M') if timestamp > 0 else tr("common.na")
             description = file_info.get('_sDescription', '')
             
             item = QTreeWidgetItem(["", file_name, file_version, file_size_mb, date_added, description])
@@ -121,7 +124,7 @@ class FileSelectDialog(QDialog):
         # --- Buttons ---
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         ok_button = button_box.button(QDialogButtonBox.Ok)
-        ok_button.setText("Download")
+        ok_button.setText(tr("common.download"))
         ok_button.setIcon(self.style().standardIcon(QStyle.SP_DialogOkButton))
         cancel_button = button_box.button(QDialogButtonBox.Cancel)
         cancel_button.setIcon(self.style().standardIcon(QStyle.SP_DialogCancelButton))
@@ -138,13 +141,13 @@ class FileSelectDialog(QDialog):
             preview_media = self.item_data.get('_aPreviewMedia', {})
             images = preview_media.get('_aImages', [])
             if not images:
-                self.on_image_failed("No preview image.")
+                self.on_image_failed(tr("fileselect.no_preview"))
                 return
 
             base_url = images[0].get('_sBaseUrl')
             file_url = images[0].get('_sFile')
             if not base_url or not file_url:
-                self.on_image_failed("Invalid image URL.")
+                self.on_image_failed(tr("fileselect.invalid_image"))
                 return
 
             self.image_loader = ImageLoader(f"{base_url}/{file_url}")
@@ -157,7 +160,7 @@ class FileSelectDialog(QDialog):
 
         except Exception as e:
             print(f"Failed to load image: {e}")
-            self.on_image_failed("Failed to load image.")
+            self.on_image_failed(tr("fileselect.image_failed"))
 
     def _load_image_worker(self):
         """Worker function to download and emit image data."""
@@ -198,7 +201,7 @@ class FileSelectDialog(QDialog):
                 break
 
         if not checked_item:
-            QMessageBox.warning(self, "No Selection", "Please select a file to download.")
+            QMessageBox.warning(self, tr("fileselect.noselect.title"), tr("fileselect.noselect.body"))
             return
 
         selected_index = self.tree.indexOfTopLevelItem(checked_item)

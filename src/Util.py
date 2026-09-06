@@ -16,6 +16,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox, QDialog, QLabel, QVBoxL
 from Constants import UPDATE_URL, APP_VERSION, STEAM_APP_ID
 from Constants import BROWSER_USER_AGENT # Import the new constant
 from Config import CONFIG_DIR, is_packaged 
+from Localization import tr
 import PakInspector
 
 # File storing user-suppressed conflict reminders. Keys are tuples stored as
@@ -165,12 +166,6 @@ def get_gb_page_url_from_item_data(item_data):
         return f"https://gamebanana.com/{item_type}s/{item_id}"
     return None
 
-def get_gb_item_name(item_type, item_id):
-    """Fetches an item's name from the GameBanana API using its type and ID."""
-    if not item_type or not item_id:
-        raise ValueError("Invalid item type or ID provided.")
-
-
 def _gb_request(url, params=None, referer=None, timeout=10):
     """Helper to perform a GET request against the GameBanana API using
     browser-like headers to reduce chance of being blocked (403).
@@ -202,13 +197,22 @@ def _gb_request(url, params=None, referer=None, timeout=10):
                 "This usually means their servers are temporarily blocking requests. "
                 "This is not an issue with CrossPatch. Please try again in a few minutes."
             )
+        # Already explained once this session; keep the message short but still
+        # readable instead of surfacing a raw HTTP error.
+        raise ConnectionError("GameBanana returned 403 Forbidden. Please try again in a few minutes.")
     resp.raise_for_status()
     return resp
+
+
+def get_gb_item_name(item_type, item_id):
+    """Fetches an item's name from the GameBanana API using its type and ID."""
+    if not item_type or not item_id:
+        raise ValueError("Invalid item type or ID provided.")
 
     # API expects singular, capitalized type (e.g., "Mod", "Sound")
     api_item_type = item_type.rstrip('s').capitalize()
     api_url = f"https://gamebanana.com/apiv11/{api_item_type}/{item_id}?_csvProperties=_sName"
-    
+
     try:
         resp = _gb_request(api_url)
         item_data = resp.json()
@@ -296,7 +300,12 @@ def get_gb_mod_version(mod_page_url):
     except requests.RequestException as e:
         raise ConnectionError(f"Could not get mod version from GameBanana API: {e}")
 
-def get_gb_mod_list(game_id, sort='default', page=1, search_query=None, category_id=None):
+# Submission types CrossPatch can install. Sound was missing, so voice packs
+# never showed up in search results even though they download and install fine.
+GB_SEARCH_MODELS = 'Mod,Wip,Sound,Tool'
+
+
+def get_gb_mod_list(game_id, sort='default', page=1, search_query=None, category_id=None, name_pattern=None):
     """
     Fetches a list of mods for a given game from the GameBanana API.
     """
@@ -308,10 +317,12 @@ def get_gb_mod_list(game_id, sort='default', page=1, search_query=None, category
     }
     # The API returns a 400 Bad Request if _csvModelInclusions is present when _sSort is 'search'.
     if sort != 'search':
-        params['_csvModelInclusions'] = 'Mod,Wip'
+        params['_csvModelInclusions'] = GB_SEARCH_MODELS
 
     # Per user suggestion, use _sName for searching on the Subfeed endpoint.
-    if search_query:
+    if name_pattern:
+        params['_sName'] = name_pattern
+    elif search_query:
         params['_sName'] = f"*{search_query}*"
     
     if category_id:
@@ -323,8 +334,9 @@ def get_gb_mod_list(game_id, sort='default', page=1, search_query=None, category
         resp = _gb_request(base_url, params=params, timeout=15)
         print(f"[DEBUG] GB API Response Status: {resp.status_code}")
         data = resp.json()
-        print(f"[DEBUG] GB API Response JSON: {json.dumps(data, indent=2)}")
-        return data.get('_aRecords', []), data.get('_aMetadata', {})
+        records = data.get('_aRecords', [])
+        print(f"[DEBUG] GB API returned {len(records)} record(s).")
+        return records, data.get('_aMetadata', {})
     except requests.RequestException as e:
         raise ConnectionError(f"Could not connect to GameBanana Subfeed API: {e}")
 
@@ -387,6 +399,59 @@ def get_gb_spotlight_mods(game_id, page=1):
     except requests.RequestException as e:
         raise ConnectionError(f"Could not connect to GameBanana Spotlight API: {e}")
 
+def _search_tokens(text):
+    """Splits a search string into words, also breaking CamelCase.
+
+    "CrossTalkRendersMod" and "CrossTalk Renders Mod" produce the same
+    tokens, which is what lets a query typed without spaces still match.
+    """
+    return re.findall(r"[A-Z]+(?![a-z])|[A-Z][a-z]+|[a-z]+|\d+", text or "")
+
+
+def _rank_by_similarity(mods, query, limit=15):
+    """Orders results by how close their name is to what was typed."""
+    from difflib import SequenceMatcher
+
+    typed = "".join(_search_tokens(query)).lower()
+    scored = []
+    for mod in mods:
+        name = "".join(_search_tokens(mod.get('_sName', ''))).lower()
+        scored.append((SequenceMatcher(None, typed, name).ratio(), mod))
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+
+    close_enough = [mod for score, mod in scored if score >= 0.35]
+    return (close_enough or [mod for _, mod in scored])[:limit]
+
+
+def search_gb_mods(game_id, query, page=1):
+    """Searches GameBanana, loosening the query when nothing comes back.
+
+    GameBanana matches the mod name literally, so one missing space returns
+    zero results even when the user typed the right words. Falls back to the
+    most distinctive word on its own, with the results ranked by how close
+    their name is to what was typed.
+
+    Returns (mods, metadata, approximate).
+    """
+    mods, metadata = get_gb_mod_list(game_id, 'default', page, query, None)
+    if mods:
+        return mods, metadata, False
+
+    tokens = [t for t in _search_tokens(query) if len(t) >= 2]
+    if not tokens:
+        return mods, metadata, False
+
+    # GameBanana only honours a leading and trailing wildcard, so there is no
+    # point trying "*Cross*Talk*Renders*Mod*" - it always comes back empty.
+    # Search the most distinctive word on its own instead, then rank.
+    longest = max(tokens, key=len)
+    print(f"[DEBUG] No exact match; searching for the word '{longest}' alone")
+    mods, metadata = get_gb_mod_list(game_id, 'default', page, name_pattern=f"*{longest}*")
+    if not mods:
+        return [], metadata, False
+    return _rank_by_similarity(mods, query), metadata, True
+
+
 def fetch_specialized_lists(game_id, sort, page):
     """Helper to call specialized list endpoints and normalize their output."""
     if sort == "Featured":
@@ -439,11 +504,8 @@ def show_update_prompt_pyside(parent, remote_version, remote_info):
     from Updater import Updater # Local import to avoid circular dependency
     reply = QMessageBox.question(
         parent,
-        "Update Available",
-        f"A new version of CrossPatch is available!\n\n"
-        f"  Your Version: {APP_VERSION}\n"
-        f"  Latest Version: {remote_version}\n\n"
-        "Would you like to download and install it now?",
+        tr("appupdate.title"),
+        tr("appupdate.body", current=APP_VERSION, latest=remote_version),
     )
     if reply == QMessageBox.Yes:
         Updater(parent, remote_info).start_update()
@@ -472,6 +534,34 @@ def list_mod_folders(path):
         return [d for d in os.listdir(path) if os.path.isdir(os.path.join(path, d))]
     except Exception:
         return []
+
+
+def generate_mod_file_list(mod_path):
+    """Returns every file shipped by a mod, relative to its folder.
+
+    Stored in info.json as "replaced_files" so the manager knows what a mod
+    puts into the game. Paths always use forward slashes so a manifest written
+    on Windows stays readable on Linux. info.json itself is excluded because it
+    is CrossPatch metadata, not mod content.
+    """
+    files = []
+    if not os.path.isdir(mod_path):
+        return files
+
+    try:
+        for root, dirs, filenames in os.walk(mod_path):
+            # Skip metadata directories that are never part of the mod payload.
+            dirs[:] = [d for d in dirs if d not in ("__MACOSX", ".git")]
+            for filename in filenames:
+                if filename.lower() == "info.json" and root == mod_path:
+                    continue
+                rel = os.path.relpath(os.path.join(root, filename), mod_path)
+                files.append(rel.replace(os.sep, "/"))
+    except Exception as e:
+        print(f"Could not build the file list for '{os.path.basename(mod_path)}': {e}")
+
+    files.sort()
+    return files
 
 
 def read_mod_info(mod_path):
@@ -625,9 +715,26 @@ def _apply_mod_configuration(mod_install_path, mod_info, profile_data):
                     if os.path.exists(dest_file):
                         os.rename(dest_file, disabled_dest_file)
 
+def _require_game_path(cfg, key):
+    """Returns cfg[key], refusing an empty value.
+
+    An unset path joins into a relative one, so mods would silently be copied
+    beside the CrossPatch executable instead of into the game.
+    """
+    value = cfg.get(key)
+    if not value:
+        raise ValueError(tr("error.game_folder_unset"))
+    return value
+
+
 def get_game_mods_folder(cfg):
+    # An empty game_root turns every os.path.join below into a *relative* path,
+    # which used to make CrossPatch create a stray "UNION" tree next to itself.
+    game_root = cfg.get("game_root")
+    if not game_root:
+        raise ValueError(tr("error.game_folder_unset"))
     return os.path.join(
-        cfg["game_root"],
+        game_root,
         "UNION",
         "Content",
         "Paks",
@@ -728,7 +835,7 @@ def _ensure_ue4ss_installed(cfg, root_window):
     # Local import to break circular dependency. Use direct import as the script is run from within src.
     from DownloadManager import DownloadManager
     """Checks if UE4SS is installed and installs it if not."""
-    win64_path = os.path.join(cfg["game_root"], "UNION", "Binaries", "Win64")
+    win64_path = os.path.join(_require_game_path(cfg, "game_root"), "UNION", "Binaries", "Win64")
     ue4ss_folder = os.path.join(win64_path, "ue4ss")
     dwmapi_dll = os.path.join(win64_path, "dwmapi.dll")
 
@@ -739,13 +846,11 @@ def _ensure_ue4ss_installed(cfg, root_window):
     # UE4SS is not installed, so we need to download it.
     reply = QMessageBox.question(
         root_window,
-        "UE4SS Not Found",
-        "A UE4SS-based mod requires UE4SS to be installed.\n\n"
-        "CrossPatch can automatically download and install it for you. "
-        "Do you want to proceed?",
+        tr("ue4ss.missing.title"),
+        tr("ue4ss.missing.body"),
     )
     if reply != QMessageBox.Yes:
-        QMessageBox.warning(root_window, "Mod Not Enabled", "The mod was not enabled because UE4SS is required.")
+        QMessageBox.warning(root_window, tr("ue4ss.skipped.title"), tr("ue4ss.skipped.body"))
         return False
 
     ue4ss_url = "https://gamebanana.com/tools/20876"
@@ -766,7 +871,7 @@ def _ensure_ue4ss_installed(cfg, root_window):
         # The function will now return immediately. The UI will be updated when the download completes.
         return True
     except Exception as e:
-        QMessageBox.critical(root_window, "UE4SS Installation Failed", f"Failed to download or install UE4SS. The mod will not be enabled.\n\nError: {e}")
+        QMessageBox.critical(root_window, tr("ue4ss.failed.title"), tr("ue4ss.failed.body", error=e))
         shutil.rmtree(temp_download_dir, ignore_errors=True)
         return False
 
@@ -877,14 +982,14 @@ def enable_mod(mod_name, cfg, priority, profile_data):
 
     src = mod_path
     if mod_type == "ue4ss-script":
-        dst = os.path.join(cfg["ue4ss_mods_folder"], mod_name)
+        dst = os.path.join(_require_game_path(cfg, "ue4ss_mods_folder"), mod_name)
         os.makedirs(dst, exist_ok=True)
         # For UE4SS Script mods, copy all files and create 'enabled.txt'
         shutil.copytree(src, dst, dirs_exist_ok=True)
         with open(os.path.join(dst, "enabled.txt"), "w") as f:
             f.write("") # The file just needs to exist.
     elif mod_type == "ue4ss-logic":
-        dst = os.path.join(cfg["ue4ss_logic_mods_folder"], mod_name)
+        dst = os.path.join(_require_game_path(cfg, "ue4ss_logic_mods_folder"), mod_name)
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         # For Logic mods, copy all contents directly. They are removed entirely on disable.
         shutil.copytree(src, dst, dirs_exist_ok=True)
@@ -937,9 +1042,9 @@ def _parse_pak_with_progress(parent, mod_path, mod_name):
     thread.start()
 
     dialog = QDialog(parent)
-    dialog.setWindowTitle("Analyzing Pak Files")
+    dialog.setWindowTitle(tr("pakparse.title"))
     layout = QVBoxLayout(dialog)
-    label = QLabel(f"Analyzing pak files for '{mod_name}'...")
+    label = QLabel(tr("pakparse.body", name=mod_name))
     layout.addWidget(label)
     progress = QProgressBar()
     progress.setRange(0, 0)  # busy indicator
@@ -1038,7 +1143,7 @@ def start_background_parse(parent, mod_path, mod_name, cfg, profile_data):
                                     pass
                 except Exception as e:
                     try:
-                        QMessageBox.warning(parent, "Pak Parser Error", f"Error during post-parse conflict check: {e}")
+                        QMessageBox.warning(parent, tr("pakparse.error.title"), tr("pakparse.error.post", error=e))
                     except Exception:
                         pass
 
@@ -1047,7 +1152,7 @@ def start_background_parse(parent, mod_path, mod_name, cfg, profile_data):
             _BACKGROUND_PARSES.pop(mod_path, None)
             def ui_err():
                 try:
-                    QMessageBox.warning(parent, "Pak Parser Error", f"Background pak parsing failed for {mod_name}: {e}")
+                    QMessageBox.warning(parent, tr("pakparse.error.title"), tr("pakparse.error.background", name=mod_name, error=e))
                 except Exception:
                     pass
             QTimer.singleShot(0, ui_err)
@@ -1089,6 +1194,35 @@ def enable_mods_from_priority(priority_list, enabled_mods_dict, cfg, root_window
         # This call will block until the batch processing (including any dialogs) is complete
         batch_processor.process_mods_batch(root_window, pak_mods_to_process)
 
+def detect_archive_format(archive_path):
+    """Returns '.zip', '.7z', '.rar' or '' for the archive at archive_path.
+
+    The file name is only a hint: GameBanana downloads are regularly served
+    with an extension that does not match the real container, which used to
+    make extraction fail with a confusing "unsupported format" error. Read the
+    magic bytes first and fall back to the extension.
+    """
+    signatures = (
+        (b"PK\x03\x04", ".zip"),
+        (b"PK\x05\x06", ".zip"),   # empty archive
+        (b"PK\x07\x08", ".zip"),   # spanned archive
+        (b"7z\xbc\xaf\x27\x1c", ".7z"),
+        (b"Rar!\x1a\x07", ".rar"),
+    )
+
+    try:
+        with open(archive_path, "rb") as f:
+            header = f.read(8)
+        for magic, fmt in signatures:
+            if header.startswith(magic):
+                return fmt
+    except Exception as e:
+        print(f"Could not read the archive header of '{os.path.basename(archive_path)}': {e}")
+
+    extension = os.path.splitext(archive_path)[1].lower()
+    return extension if extension in (".zip", ".7z", ".rar") else ""
+
+
 def extract_archive(archive_path, dest_path, progress_signal=None, clean_destination=True, finished_signal=None):
     """
     Extracts an archive to a destination path and handles nested folders.
@@ -1108,7 +1242,7 @@ def extract_archive(archive_path, dest_path, progress_signal=None, clean_destina
             shutil.rmtree(dest_path)
     os.makedirs(dest_path, exist_ok=True)
 
-    archive_format = os.path.splitext(archive_path)[1].lower()
+    archive_format = detect_archive_format(archive_path)
     print(f"Detected archive format: {archive_format}")
 
     if progress_signal: progress_signal.emit("Extracting...")
@@ -1117,11 +1251,15 @@ def extract_archive(archive_path, dest_path, progress_signal=None, clean_destina
         print("Using zipfile to extract.")
         with zipfile.ZipFile(archive_path, 'r') as z_ref:
             z_ref.extractall(dest_path)
-    elif archive_format == '.7z' and PY7ZR_SUPPORT:
+    elif archive_format == '.7z':
+        if not PY7ZR_SUPPORT:
+            raise RuntimeError(tr("archive.no_py7zr"))
         print("Using py7zr to extract.")
         with py7zr.SevenZipFile(archive_path, 'r') as z_ref:
             z_ref.extractall(path=dest_path)
-    elif archive_format == '.rar' and UNRAR_SUPPORT:
+    elif archive_format == '.rar':
+        if not UNRAR_SUPPORT:
+            raise RuntimeError(tr("archive.no_rarfile"))
         print("Using unrar to extract.")
         # Check for a bundled unrar executable in the assets folder first
         assets_dir = find_assets_dir()
@@ -1138,7 +1276,7 @@ def extract_archive(archive_path, dest_path, progress_signal=None, clean_destina
         with rarfile.RarFile(archive_path) as rf:
             rf.extractall(path=dest_path)
     else:
-        raise NotImplementedError(f"Unsupported archive format: {archive_format}. Please install the required library if available.")
+        raise NotImplementedError(tr("archive.unsupported", format=archive_format or "?"))
 
     print("Initial extraction complete.")
 

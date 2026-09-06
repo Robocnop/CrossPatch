@@ -30,24 +30,71 @@ CONFIG_DIR = get_config_dir()
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 os.makedirs(CONFIG_DIR, exist_ok=True)
 
+DEFAULT_MODS_DIR_NAME = "mods"
+
+
+def ensure_mods_folder(path):
+    """Creates the mods folder if it is missing and returns it.
+
+    Returns None when the folder cannot be created (removed external drive,
+    bad drive letter, missing permissions...) so callers can react instead of
+    silently ending up with an empty mod list.
+    """
+    if not path:
+        return None
+    try:
+        os.makedirs(path, exist_ok=True)
+        return path
+    except Exception as e:
+        print(f"Could not create mods folder '{path}': {e}")
+        return None
+
+
 def default_mods_folder():
-    """Determines the default mods folder path based on operating mode."""
+    """Determines the default mods folder path, creating it on disk."""
     if os.environ.get("CROSSPATCH_PORTABLE") == "1":
-        path = os.path.join(os.getcwd(), "mods")
+        path = os.path.join(os.getcwd(), DEFAULT_MODS_DIR_NAME)
         os.makedirs(path, exist_ok=True)
         return path
 
     # Ensure a QApplication instance exists
     app = QApplication.instance() or QApplication(sys.argv)
 
-    QMessageBox.information(None, "Welcome to CrossPatch!", "Please select a folder to store your mods.\nNote: this is NOT your game's ~mods folder.")
+    # Pre-create a sensible default so first-time users can simply accept it.
+    suggested = os.path.join(CONFIG_DIR, DEFAULT_MODS_DIR_NAME)
+    ensure_mods_folder(suggested)
+
+    # Imported here: Localization imports Config, so a module-level import
+    # would be circular. This also lets the very first dialog speak the
+    # system language, before any config file exists.
+    from Localization import ensure_initialized, tr
+    ensure_initialized()
+
+    reply = QMessageBox.question(
+        None,
+        tr("setup.mods.title"),
+        tr("setup.mods.body", path=suggested),
+        QMessageBox.Yes | QMessageBox.No,
+        QMessageBox.Yes,
+    )
+
+    if reply == QMessageBox.Yes and os.path.isdir(suggested):
+        return suggested
+
     folder = QFileDialog.getExistingDirectory(
         None,
-        "Select a folder to store your mods"
+        tr("setup.mods.pick"),
+        suggested,
     )
     if not folder:
-        sys.exit("No mods folder selected. Exiting.")
-    return folder
+        # Cancelling used to abort startup entirely. Fall back to the default
+        # instead so the user always ends up with a working install.
+        if os.path.isdir(suggested):
+            print("No mods folder selected; falling back to the default location.")
+            return suggested
+        sys.exit("No mods folder selected and the default could not be created. Exiting.")
+
+    return ensure_mods_folder(folder) or folder
 
 def default_game_folder():
     """Tries to auto-detect the game folder, and prompts the user if it fails."""
@@ -55,12 +102,14 @@ def default_game_folder():
     detected = False
     if platform.system() == "Windows":
         try:
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\\Valve\\Steam") as key:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam") as key:
                 steam_path = winreg.QueryValueEx(key, "SteamPath")[0]
                 default_root = _find_game_in_steam_libraries(steam_path)
                 detected = bool(default_root)
         except FileNotFoundError:
             print("Steam registry key not found.")
+        except OSError as e:
+            print(f"Could not read the Steam registry key: {e}")
     elif platform.system() == "Linux":
         # This path is still a guess, but it's a common one.
         linux_path = os.path.join(os.path.expanduser("~"), ".local", "share", "Steam", "steamapps", "common", "SonicRacingCrossWorlds")
@@ -71,12 +120,10 @@ def default_game_folder():
     if not default_root:
         # Auto-detection failed, prompt the user.
         app = QApplication.instance() or QApplication(sys.argv)
-        QMessageBox.information(
-            None,
-            "Setup: Game Directory",
-            "Could not automatically find Sonic Racing Crossworlds. Please select the game's installation folder."
-        )
-        folder = QFileDialog.getExistingDirectory(None, "Select Sonic Racing Crossworlds Folder")
+        from Localization import ensure_initialized, tr
+        ensure_initialized()
+        QMessageBox.information(None, tr("setup.game.title"), tr("setup.game.body"))
+        folder = QFileDialog.getExistingDirectory(None, tr("setup.game.pick"))
 
         if not folder:
             sys.exit("No game folder selected. Exiting.")
@@ -164,6 +211,36 @@ def _find_game_in_steam_libraries(steam_path, app_id="2486820"):
     print("Game not found in any Steam library.")
     return "" # Return empty if not found
 
+def _apply_config_defaults(cfg):
+    """Fills in keys added by newer CrossPatch versions.
+
+    Configs written by an older release (or hand-edited ones) are missing keys
+    that the rest of the app reads with cfg["..."], which used to crash the
+    whole window on startup. Returns True when something was added.
+    """
+    game_root = cfg.get("game_root") or ""
+    defaults = {
+        "mods_folder": os.path.join(CONFIG_DIR, DEFAULT_MODS_DIR_NAME),
+        "game_root": game_root,
+        "game_mods_folder": os.path.join(game_root, "UNION", "Content", "Paks", "~mods") if game_root else "",
+        "ue4ss_mods_folder": os.path.join(game_root, "UNION", "Binaries", "Win64", "ue4ss", "Mods") if game_root else "",
+        "ue4ss_logic_mods_folder": os.path.join(game_root, "UNION", "Content", "Paks", "LogicMods") if game_root else "",
+        "enabled_mods": {},
+        "show_cmd_logs": False,
+        "steam_detected": False,
+        "mod_priority": [],
+        "window_size": "580x720",
+        "language": "auto",
+    }
+
+    changed = False
+    for key, value in defaults.items():
+        if cfg.get(key) is None:
+            cfg[key] = value
+            changed = True
+    return changed
+
+
 def load_config():
     """Loads the configuration from disk, creating a default one only if it doesn't exist."""
     if os.path.exists(CONFIG_FILE):
@@ -172,24 +249,33 @@ def load_config():
                 config_data = json.load(f)
             # Basic validation to ensure it's a dictionary
             if isinstance(config_data, dict):
+                if _apply_config_defaults(config_data):
+                    print("Config was missing some keys; they have been restored.")
+                    save_config(config_data)
+                # The mods folder may have been deleted or live on a drive that
+                # is no longer mounted; recreate it so mods stay visible and
+                # downloads have somewhere to land.
+                ensure_mods_folder(config_data.get("mods_folder"))
                 return config_data
         except json.JSONDecodeError as e:
             # The file is corrupt. Back it up and notify the user.
             print(f"Error loading config.json: {e}")
             corrupt_path = os.path.join(CONFIG_DIR, "config.json.corrupt")
+            from Localization import ensure_initialized, tr
+            ensure_initialized()
             try:
                 app = QApplication.instance() or QApplication(sys.argv)
                 os.rename(CONFIG_FILE, corrupt_path)
                 QMessageBox.warning(
                     None,
-                    "Configuration Error",
-                    f"Your config.json file was corrupt and has been backed up to:\n{corrupt_path}\n\nA new configuration will be created."
+                    tr("setup.corrupt.title"),
+                    tr("setup.corrupt.backed_up", path=corrupt_path)
                 )
             except Exception as backup_error:
                 QMessageBox.critical(
                     None,
-                    "Configuration Error",
-                    f"Your config.json file is corrupt, but could not be backed up.\n\nError: {backup_error}"
+                    tr("setup.corrupt.title"),
+                    tr("setup.corrupt.failed", error=backup_error)
                 )
         except Exception as e:
             print(f"An unexpected error occurred while loading config: {e}")

@@ -4,35 +4,36 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt
 from Util import load_ignored_conflicts, save_ignored_conflicts
+from Localization import tr
 
 
 class IgnoredConflictsDialog(QDialog):
     """Dialog to view and clear ignored conflict pairs."""
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Ignored Conflicts")
+        self.setWindowTitle(tr("ignored.title"))
         self.resize(600, 400)
 
         main_layout = QVBoxLayout(self)
 
-        header = QLabel("Ignored conflict pairs (mod ⇄ provider).\nUse the controls below to remove individual entries or clear all.")
+        header = QLabel(tr("ignored.header"))
         main_layout.addWidget(header)
 
         self.list_widget = QListWidget()
         main_layout.addWidget(self.list_widget)
 
         btn_layout = QHBoxLayout()
-        self.remove_btn = QPushButton("Remove Selected")
+        self.remove_btn = QPushButton(tr("ignored.remove"))
         self.remove_btn.clicked.connect(self.remove_selected)
         btn_layout.addWidget(self.remove_btn)
 
-        self.clear_btn = QPushButton("Clear All")
+        self.clear_btn = QPushButton(tr("ignored.clear_all"))
         self.clear_btn.clicked.connect(self.clear_all)
         btn_layout.addWidget(self.clear_btn)
 
         btn_layout.addStretch()
 
-        close_btn = QPushButton("Close")
+        close_btn = QPushButton(tr("common.close"))
         close_btn.clicked.connect(self.accept)
         btn_layout.addWidget(close_btn)
 
@@ -62,7 +63,7 @@ class IgnoredConflictsDialog(QDialog):
         self._load_entries()
 
     def clear_all(self):
-        reply = QMessageBox.question(self, "Clear All", "Clear all ignored conflict entries? This cannot be undone.")
+        reply = QMessageBox.question(self, tr("ignored.clear.title"), tr("ignored.clear.body"))
         if reply != QMessageBox.Yes:
             return
         save_ignored_conflicts([])

@@ -3,12 +3,13 @@ from PySide6.QtWidgets import (
     QApplication, QDialog, QVBoxLayout, QFormLayout, QLineEdit,
     QComboBox, QDialogButtonBox, QLabel
 )
+from Localization import tr
 
 class EditModWindow(QDialog):
     def __init__(self, parent, display_name, data):
         super().__init__(parent)
 
-        self.setWindowTitle(f"Edit {display_name} info.json")
+        self.setWindowTitle(tr("editmod.title", name=display_name))
         self.setModal(True)
         self.setFixedSize(400, 250)  
 
@@ -30,11 +31,11 @@ class EditModWindow(QDialog):
         self.mod_type_combo.addItems(["pak", "ue4ss-script", "ue4ss-logic"])
         self.mod_type_combo.setCurrentText(self.original_mod_type)
 
-        form_layout.addRow(QLabel("Name:"), self.name_edit)
-        form_layout.addRow(QLabel("Version:"), self.version_edit)
-        form_layout.addRow(QLabel("Author:"), self.author_edit)
-        form_layout.addRow(QLabel("Mod Type:"), self.mod_type_combo)
-        form_layout.addRow(QLabel("Mod Page:"), self.mod_page_edit)
+        form_layout.addRow(QLabel(tr("editmod.name")), self.name_edit)
+        form_layout.addRow(QLabel(tr("editmod.version")), self.version_edit)
+        form_layout.addRow(QLabel(tr("editmod.author")), self.author_edit)
+        form_layout.addRow(QLabel(tr("editmod.type")), self.mod_type_combo)
+        form_layout.addRow(QLabel(tr("editmod.page")), self.mod_page_edit)
 
         # --- Buttons ---
         button_box = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
