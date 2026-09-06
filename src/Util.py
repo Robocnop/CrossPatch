@@ -158,7 +158,12 @@ def get_gb_page_url_from_item_data(item_data):
     """Constructs a full GameBanana page URL from item data."""
     profile_url = item_data.get('_sProfileUrl')
     if profile_url:
-        return f"https://gamebanana.com/{profile_url}"
+        # The API returns this absolute ("https://gamebanana.com/mods/123"), so
+        # prefixing it again built an unusable URL and every download ended up
+        # with an empty mod_page - no update checks, no author.
+        if profile_url.startswith(('http://', 'https://')):
+            return profile_url
+        return f"https://gamebanana.com/{profile_url.lstrip('/')}"
     
     item_type = item_data.get('_sModelName', '').lower()
     item_id = item_data.get('_idRow')
@@ -241,7 +246,7 @@ def get_gb_item_data_from_url(url):
         raise ValueError("Could not extract a valid item type and ID from the URL.")
 
     api_item_type = item_type.rstrip('s').capitalize()
-    api_url = f"https://gamebanana.com/apiv11/{api_item_type}/{item_id}?_csvProperties=_sName,_aFiles,_sDescription,_sText,_aPreviewMedia"
+    api_url = f"https://gamebanana.com/apiv11/{api_item_type}/{item_id}?_csvProperties=_sName,_sVersion,_aFiles,_sDescription,_sText,_aPreviewMedia,_aSubmitter,_sProfileUrl,_idRow,_sModelName"
     
     try:
         # Use the page URL as the Referer to more closely emulate a browser
@@ -262,7 +267,7 @@ def get_gb_item_data_by_id(item_type, item_id):
 
     # API expects singular, capitalized type (e.g., "Mod", "Sound")
     api_item_type = item_type.rstrip('s').capitalize()
-    api_url = f"https://gamebanana.com/apiv11/{api_item_type}/{item_id}?_csvProperties=_sName,_aFiles,_sDescription,_sText,_aPreviewMedia"
+    api_url = f"https://gamebanana.com/apiv11/{api_item_type}/{item_id}?_csvProperties=_sName,_sVersion,_aFiles,_sDescription,_sText,_aPreviewMedia,_aSubmitter,_sProfileUrl,_idRow,_sModelName"
     
     try:
         resp = _gb_request(api_url)
@@ -286,23 +291,108 @@ def get_gb_mod_version(mod_page_url):
         ValueError: If the URL is invalid or details cannot be extracted.
         requests.RequestException: If there's a network-related error.
     """
+    return get_gb_mod_version_and_author(mod_page_url)[0]
+
+
+def get_gb_mod_version_and_author(mod_page_url):
+    """Fetches a mod's latest version *and* its submitter name in one request.
+
+    The update check already hits this endpoint for every installed mod, so
+    asking for the submitter at the same time costs nothing and lets us
+    backfill the author of mods that were installed before CrossPatch started
+    recording it (they all showed up as "Unknown").
+
+    Returns (version, author); either may be None when GameBanana omits it.
+    """
     item_type, item_id = get_gb_item_details_from_url(mod_page_url)
     if not item_type or not item_id:
         raise ValueError("Could not extract valid item details from the URL.")
 
     api_item_type = item_type.rstrip('s').capitalize()
-    api_url = f"https://gamebanana.com/apiv11/{api_item_type}/{item_id}?_csvProperties=_sVersion"
-    
+    api_url = f"https://gamebanana.com/apiv11/{api_item_type}/{item_id}?_csvProperties=_sVersion,_aSubmitter"
+
     try:
         resp = _gb_request(api_url)
         item_data = resp.json()
-        return item_data.get("_sVersion")
+        submitter = item_data.get("_aSubmitter") or {}
+        return item_data.get("_sVersion"), submitter.get("_sName")
     except requests.RequestException as e:
         raise ConnectionError(f"Could not get mod version from GameBanana API: {e}")
 
 # Submission types CrossPatch can install. Sound was missing, so voice packs
 # never showed up in search results even though they download and install fine.
 GB_SEARCH_MODELS = 'Mod,Wip,Sound,Tool'
+
+
+# Submission types GameBanana does not count downloads for (News posts show up
+# in the Featured feed). Remembered so we stop re-asking on every page.
+_MODELS_WITHOUT_DOWNLOAD_COUNT = set()
+
+
+def _extract_download_count(record):
+    """Reads a submission's download total, whichever key the API used."""
+    for key in ('_nDownloadCount', '_nTotalDownloads'):
+        value = record.get(key)
+        if isinstance(value, int):
+            return value
+    return None
+
+
+def add_download_counts(records):
+    """Fills in the download total the list endpoints never return.
+
+    Subfeed, TopSubs, Featured and CommunitySpotlight all ignore a
+    `_nDownloadCount` in `_csvProperties` and simply never include it, so every
+    browse card used to read a missing key and show a flat 0. The Multi
+    endpoint does return it, so we ask for the whole page at once - one extra
+    request per submission type, not per mod.
+
+    Records are updated in place and returned for convenience. Any failure is
+    swallowed: a missing counter must never cost the user the mod list.
+    """
+    if not records or not isinstance(records, list):
+        return records
+
+    missing = {}
+    for record in records:
+        if not isinstance(record, dict) or _extract_download_count(record) is not None:
+            continue
+        model = record.get('_sModelName')
+        item_id = record.get('_idRow')
+        if model and item_id and model not in _MODELS_WITHOUT_DOWNLOAD_COUNT:
+            missing.setdefault(model, {})[item_id] = record
+
+    for model, by_id in missing.items():
+        try:
+            resp = _gb_request(
+                f"https://gamebanana.com/apiv11/{model}/Multi",
+                params={
+                    '_csvRowIds': ','.join(str(i) for i in by_id),
+                    '_csvProperties': '_idRow,_nDownloadCount',
+                },
+                timeout=15,
+            )
+            rows = resp.json()
+        except Exception as e:
+            print(f"[DEBUG] Could not fetch {model} download counts: {e}")
+            continue
+
+        # A single unknown id makes GameBanana reject the whole batch with a
+        # dict-shaped error instead of the expected list.
+        if not isinstance(rows, list):
+            error = (rows or {}).get('_aErrorData', {}).get('_csvProperties', {})
+            if error.get('_sErrorCode') == 'UNKNOWN_PROPERTY':
+                # e.g. News posts, which simply have nothing to download.
+                _MODELS_WITHOUT_DOWNLOAD_COUNT.add(model)
+            print(f"[DEBUG] No download counts for {model}: {rows}")
+            continue
+
+        for row in rows:
+            target = by_id.get(row.get('_idRow'))
+            if target is not None and isinstance(row.get('_nDownloadCount'), int):
+                target['_nDownloadCount'] = row['_nDownloadCount']
+
+    return records
 
 
 def get_gb_mod_list(game_id, sort='default', page=1, search_query=None, category_id=None, name_pattern=None):
@@ -313,7 +403,7 @@ def get_gb_mod_list(game_id, sort='default', page=1, search_query=None, category
     params = {
         '_sSort': sort,
         '_nPage': page,
-        '_csvProperties': '_sName,_sProfileUrl,_nLikeCount,_nViewCount,_nTotalDownloads,_aSubmitter,_aPreviewMedia,_aFiles'
+        '_csvProperties': '_sName,_sProfileUrl,_nLikeCount,_nViewCount,_nDownloadCount,_aSubmitter,_aPreviewMedia,_aFiles'
     }
     # The API returns a 400 Bad Request if _csvModelInclusions is present when _sSort is 'search'.
     if sort != 'search':
@@ -345,7 +435,7 @@ def get_gb_top_mods(game_id, page=1):
     base_url = f"https://gamebanana.com/apiv11/Game/{game_id}/TopSubs"
     params = {
         '_nPage': page,
-        '_csvProperties': '_sName,_sProfileUrl,_nLikeCount,_nViewCount,_nTotalDownloads,_aSubmitter,_aPreviewMedia,_aFiles'
+        '_csvProperties': '_sName,_sProfileUrl,_nLikeCount,_nViewCount,_nDownloadCount,_aSubmitter,_aPreviewMedia,_aFiles'
     }
     print(f"[DEBUG] Fetching GB Top mods. URL: {base_url}, Params: {params}")
     try:
@@ -362,7 +452,7 @@ def get_gb_featured_mods(game_id, page=1):
     params = {
         '_nPage': page,
         '_idGameRow': game_id,
-        '_csvProperties': '_sName,_sProfileUrl,_nLikeCount,_nViewCount,_nTotalDownloads,_aSubmitter,_aPreviewMedia,_aFiles'
+        '_csvProperties': '_sName,_sProfileUrl,_nLikeCount,_nViewCount,_nDownloadCount,_aSubmitter,_aPreviewMedia,_aFiles'
     }
     print(f"[DEBUG] Fetching GB Featured mods. URL: {base_url}, Params: {params}")
     try:
@@ -379,7 +469,7 @@ def get_gb_spotlight_mods(game_id, page=1):
     base_url = f"https://gamebanana.com/apiv11/Game/{game_id}/CommunitySpotlight"
     params = {
         '_nPage': page,
-        '_csvProperties': '_sName,_sProfileUrl,_nLikeCount,_nViewCount,_nTotalDownloads,_aSubmitter,_aPreviewMedia,_aFiles'
+        '_csvProperties': '_sName,_sProfileUrl,_nLikeCount,_nViewCount,_nDownloadCount,_aSubmitter,_aPreviewMedia,_aFiles'
     }
     print(f"[DEBUG] Fetching GB Spotlight mods. URL: {base_url}, Params: {params}")
     try:
@@ -435,7 +525,7 @@ def search_gb_mods(game_id, query, page=1):
     """
     mods, metadata = get_gb_mod_list(game_id, 'default', page, query, None)
     if mods:
-        return mods, metadata, False
+        return add_download_counts(mods), metadata, False
 
     tokens = [t for t in _search_tokens(query) if len(t) >= 2]
     if not tokens:
@@ -449,7 +539,7 @@ def search_gb_mods(game_id, query, page=1):
     mods, metadata = get_gb_mod_list(game_id, 'default', page, name_pattern=f"*{longest}*")
     if not mods:
         return [], metadata, False
-    return _rank_by_similarity(mods, query), metadata, True
+    return add_download_counts(_rank_by_similarity(mods, query)), metadata, True
 
 
 def fetch_specialized_lists(game_id, sort, page):
@@ -460,7 +550,7 @@ def fetch_specialized_lists(game_id, sort, page):
         mods, metadata = get_gb_spotlight_mods(game_id, page), {'_bIsComplete': True} # No pagination
     else: # Default to "Top"
         mods, metadata = get_gb_top_mods(game_id, page)
-    return mods, metadata
+    return add_download_counts(mods), metadata
 
 
 def fetch_remote_version():
@@ -603,6 +693,48 @@ def read_mod_info(mod_path):
         "author": "Unknown",
         "mod_type": detected_type
     }
+
+def get_mod_download_count(mod_data):
+    """Download total to show on a browse card, 0 when GameBanana gave none."""
+    count = _extract_download_count(mod_data or {})
+    return count if count is not None else 0
+
+
+def backfill_mod_author(mod_path, author):
+    """Writes an author into an existing info.json when it has none.
+
+    Only fills the gap: an author the user set by hand in Edit Mod Info is
+    never overwritten.
+    """
+    if not author or not os.path.isdir(mod_path):
+        return False
+
+    info_file = os.path.join(mod_path, "info.json")
+    if not os.path.exists(info_file):
+        return False
+
+    try:
+        with open(info_file, "r", encoding="utf-8") as f:
+            info = json.load(f)
+    except Exception:
+        return False
+
+    current = (info.get("author") or "").strip()
+    if current and current.lower() != "unknown":
+        return False
+
+    info["author"] = author
+    try:
+        with open(info_file, "w", encoding="utf-8") as f:
+            json.dump(info, f, indent=2)
+    except Exception as e:
+        print(f"Could not record the author of '{os.path.basename(mod_path)}': {e}")
+        return False
+
+    _READ_MOD_INFO_CACHE.pop(info_file, None)
+    print(f"Recorded '{author}' as the author of '{os.path.basename(mod_path)}'.")
+    return True
+
 
 def discover_mod_configuration(mod_path):
     """

@@ -122,7 +122,7 @@ class ModCard(QFrame):
         # Stats (Likes/Downloads)
         stats_layout = QHBoxLayout()
         likes = self.mod_data.get('_nLikeCount', 0)
-        downloads = self.mod_data.get('_nTotalDownloads', 0)
+        downloads = Util.get_mod_download_count(self.mod_data)
         stats_layout.addWidget(QLabel(f"👍 {likes}"))
         stats_layout.addWidget(QLabel(f"📥 {downloads}"))
         stats_layout.addStretch()
@@ -1206,7 +1206,12 @@ class CrossPatchWindow(QMainWindow):
 
         dialog = EditModWindow(self, display_name, data)
         if dialog.exec():
-            new_data = dialog.get_data()
+            # The dialog only knows about the five editable fields, so write it
+            # over the existing info.json instead of replacing the file - a
+            # plain dump dropped pak_data, replaced_files and configuration.
+            new_data = dict(data)
+            new_data.pop("mod_page", None)
+            new_data.update(dialog.get_data())
             original_mod_type = dialog.original_mod_type
             try:
                 with open(os.path.join(mod_folder, "info.json"), "w", encoding="utf-8") as f:
@@ -1289,6 +1294,7 @@ class CrossPatchWindow(QMainWindow):
     def check_all_mod_updates(self, manual_check=False):
         print("Checking all mods for updates...")
         updates = {}
+        self._authors_backfilled = False
         mod_folders = Util.list_mod_folders(self.cfg["mods_folder"])
 
         for mod_folder_name in mod_folders:
@@ -1301,7 +1307,15 @@ class CrossPatchWindow(QMainWindow):
                 continue
 
             try:
-                gb_version = Util.get_gb_mod_version(mod_page)
+                gb_version, gb_author = Util.get_gb_mod_version_and_author(mod_page)
+                # Mods installed by older CrossPatch builds never got an author
+                # written to info.json, so the list showed "Unknown" forever.
+                # The update check already talks to GameBanana here, so fix it
+                # in passing rather than firing another request.
+                if Util.backfill_mod_author(
+                    os.path.join(self.cfg["mods_folder"], mod_folder_name), gb_author
+                ):
+                    self._authors_backfilled = True
                 if not gb_version:
                     continue
                 if Util.is_newer_version(mod_version, gb_version):
@@ -1323,22 +1337,23 @@ class CrossPatchWindow(QMainWindow):
         """Slot to handle the results of the background mod update check."""
         # Only update the UI if the set of updates actually changed. This avoids
         # an unnecessary second Treeview refresh during startup when nothing
-        # meaningful changed since the initial rendering.
-        if updates != self.updatable_mods:
+        # meaningful changed since the initial rendering. A backfilled author is
+        # also worth a redraw, otherwise the list keeps showing "Unknown" until
+        # the next manual refresh.
+        updates_changed = updates != self.updatable_mods
+        authors_backfilled = getattr(self, "_authors_backfilled", False)
+        self._authors_backfilled = False
+
+        if updates_changed or authors_backfilled:
             self.updatable_mods = updates
             self._update_treeview(preserve_selection=True)
-        else:
-            # If this was a manual check, still notify the user even if nothing changed.
-            if manual_check:
-                if updates:
-                    QMessageBox.information(self, tr("modupdate.found.title"), tr("modupdate.found.body", count=len(updates)))
-                else:
-                    QMessageBox.information(self, tr("modupdate.none.title"), tr("modupdate.none.body"))
 
-        # If it was a manual check and there were updates, we may still need to
-        # inform the user even if the internal mapping hasn't changed (edge cases).
-        if manual_check and updates and updates != self.updatable_mods:
-            QMessageBox.information(self, tr("modupdate.found.title"), tr("modupdate.found.body", count=len(updates)))
+        # If this was a manual check, notify the user even if nothing changed.
+        if manual_check and not updates_changed:
+            if updates:
+                QMessageBox.information(self, tr("modupdate.found.title"), tr("modupdate.found.body", count=len(updates)))
+            else:
+                QMessageBox.information(self, tr("modupdate.none.title"), tr("modupdate.none.body"))
 
         print("Mod update check finished.")
 
@@ -1360,7 +1375,9 @@ class CrossPatchWindow(QMainWindow):
             return
 
         try:
-            gb_version = Util.get_gb_mod_version(mod_page)
+            gb_version, gb_author = Util.get_gb_mod_version_and_author(mod_page)
+            if Util.backfill_mod_author(os.path.join(self.cfg["mods_folder"], mod_folder), gb_author):
+                self._update_treeview(preserve_selection=True)
             if not gb_version:
                 QMessageBox.warning(self, tr("modupdate.none.title"), tr("modupdate.noversion.body"))
                 return
@@ -1659,7 +1676,10 @@ class CrossPatchWindow(QMainWindow):
     def _update_browse_cards(self, mods):
         mods, metadata = mods
         self._clear_card_layout()
-        print(f"[DEBUG] _update_browse_cards received: {mods}")
+        # Dumping the raw records here printed ~25 KB per page and killed the
+        # whole browse tab whenever a mod name held a character the console
+        # encoding could not represent (UnicodeEncodeError inside a Qt event).
+        print(f"[DEBUG] _update_browse_cards received {len(mods) if isinstance(mods, list) else 0} record(s)")
         self.browse_mods_data = []
 
         # Update pagination buttons based on metadata

@@ -191,9 +191,11 @@ class DownloadManager:
             extract_path = extract_path_override or os.path.join(self.mods_folder, mod_folder_name or clean_item_name)
 
             existing_mod_page = None
+            existing_author = None
             if mod_folder_name:
                 existing_info = Util.read_mod_info(extract_path)
                 existing_mod_page = existing_info.get('mod_page')
+                existing_author = existing_info.get('author')
 
             if mod_folder_name and os.path.isdir(extract_path):
                 shutil.rmtree(extract_path)
@@ -205,7 +207,11 @@ class DownloadManager:
 
             # Update info.json with all available data
             page_url = existing_mod_page or Util.get_gb_page_url_from_item_data(full_item_data)
-            self._create_and_update_mod_info(extract_path, full_item_data, file_info, page_url)
+            # The folder was wiped above, so the previous author has to be
+            # carried over explicitly or an update would reset it.
+            self._create_and_update_mod_info(
+                extract_path, full_item_data, file_info, page_url, fallback_author=existing_author
+            )
 
             self._cleanup_temp_archive(temp_archive_path)
             # If we were downloading to a temp folder (like for UE4SS), clean it up.
@@ -237,7 +243,7 @@ class DownloadManager:
             self._ensure_mods_folder()
 
             api_item_type = item_type.capitalize()
-            api_url = f"https://gamebanana.com/apiv11/{api_item_type}/{item_id}?_csvProperties=_sName,_aFiles"
+            api_url = f"https://gamebanana.com/apiv11/{api_item_type}/{item_id}?_csvProperties=_sName,_sVersion,_aFiles,_aSubmitter"
             response = requests.get(api_url, headers={'User-Agent': BROWSER_USER_AGENT}, timeout=15)
             response.raise_for_status()
             item_data = response.json()
@@ -297,19 +303,27 @@ class DownloadManager:
                         self.signals.progress.emit(int(progress))
                         self.signals.progress_text.emit(tr("dl.progress", done=f"{bytes_downloaded/1024/1024:.2f}", total=f"{total_size/1024/1024:.2f}"))
 
-    def _create_and_update_mod_info(self, mod_path, full_item_data, file_info, page_url):
+    def _create_and_update_mod_info(self, mod_path, full_item_data, file_info, page_url, fallback_author=None):
         """Creates or overwrites the info.json file with comprehensive data after download."""
         if not os.path.isdir(mod_path): return
         try:
             info_path = os.path.join(mod_path, "info.json")
             
+            existing_info = Util.read_mod_info(mod_path)
+
+            # The API only reports a submitter when we ask for _aSubmitter, and
+            # older releases never did - so fall back to whatever info.json
+            # already holds instead of stamping "Unknown" over a good name.
+            submitter = full_item_data.get('_aSubmitter') or {}
+            author = submitter.get('_sName') or fallback_author or existing_info.get('author') or 'Unknown'
+
             # Build the info dict from scratch using the rich data we have.
             new_info = {
                 "name": full_item_data.get('_sName', os.path.basename(mod_path)),
                 "version": file_info.get('_sVersion') or full_item_data.get('_sVersion') or "1.0",
-                "author": full_item_data.get('_aSubmitter', {}).get('_sName', 'Unknown'),
+                "author": author,
                 "mod_page": page_url or "",
-                "mod_type": Util.read_mod_info(mod_path).get('mod_type', 'pak'), # Preserve auto-detected type
+                "mod_type": existing_info.get('mod_type', 'pak'), # Preserve auto-detected type
                 "replaced_files": [],
             }
 
