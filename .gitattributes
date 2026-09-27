@@ -1,2 +1,8 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Shell scripts and the Docker build run on Linux: a CRLF checkout on Windows
+# breaks them with "bad interpreter".
+*.sh text eol=lf
+packaging/linux/** text eol=lf
+packaging/linux/Dockerfile text eol=lf

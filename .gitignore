@@ -193,3 +193,9 @@ signing/
 
 # Local notes for Claude Code, not part of the project
 CLAUDE.md
+
+# The release specs are kept in packaging/ on purpose.
+!packaging/**/*.spec
+
+# Local code index
+.codegraph/
