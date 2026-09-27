@@ -87,8 +87,12 @@ def restore_backup(path):
     contents = read_backup(path)
     safety = auto_backup("before-restore")
     for name, data in contents.items():
-        with open(os.path.join(CONFIG_DIR, name), "wb") as f:
+        # Same pattern as Config.save_config: a failure half way through must
+        # not leave a truncated config.json behind.
+        target = os.path.join(CONFIG_DIR, name)
+        with open(target + ".tmp", "wb") as f:
             f.write(data)
+        os.replace(target + ".tmp", target)
     return safety
 
 

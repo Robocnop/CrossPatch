@@ -14,13 +14,20 @@ chmod +x "$HERE/CrossPatch" "$HERE/run.sh" 2>/dev/null || true
 [ -f "$HERE/tools/CrossPatchParser" ] && chmod +x "$HERE/tools/CrossPatchParser" 2>/dev/null || true
 
 mkdir -p "$APPS_DIR"
+
+# Exec= has its own quoting rules: the path is double-quoted, and inside the
+# quotes a backslash, ", ` and $ are escaped (with every escaping backslash
+# doubled once more by the file format), and % becomes %%. Without this a
+# folder with a space in its name broke both the menu entry and 1-Click.
+EXEC_PATH=$(printf '%s' "$HERE/run.sh" | sed -e 's/\\/\\\\\\\\/g' -e 's/["`$]/\\\\&/g' -e 's/%/%%/g')
+
 cat > "$DESKTOP_FILE" <<DESKTOP
 [Desktop Entry]
 Type=Application
 Name=CrossPatch
 GenericName=Crossworlds Mod Manager
 Comment=Mod manager for Sonic Racing: CrossWorlds
-Exec=$HERE/run.sh %u
+Exec="$EXEC_PATH" %u
 Icon=$HERE/assets/CrossP.png
 Terminal=false
 Categories=Game;Utility;

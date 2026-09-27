@@ -9,7 +9,7 @@ contains everything it needs, so there is nothing to compile and no Python or
 ## Quick start
 
 ```bash
-unzip CrossPatch-<version>-linux-x64.zip
+unzip CrossPatch-*-linux-x64.zip
 cd CrossPatch
 ./run.sh
 ```

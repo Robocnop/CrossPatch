@@ -1631,11 +1631,13 @@ class CrossPatchWindow(QMainWindow):
             return
 
     def _on_dropped_installed(self):
-        self.refresh()
         if getattr(self, "_drop_queue", None):
             self._install_next_dropped()
-        else:
-            self.status_label.setText(tr("drop.done"))
+            return
+        # Once, at the end: a refresh scanning the mods folder while the next
+        # archive is still being extracted would list it half written.
+        self.refresh()
+        self.status_label.setText(tr("drop.done"))
 
     def update_all_mods(self):
         if not self.updatable_mods:

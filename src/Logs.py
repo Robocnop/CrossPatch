@@ -24,10 +24,12 @@ _log_path = None
 class _Tee:
     """Writes to the log file and to whichever console stream is attached."""
 
-    def __init__(self, log_file, console):
+    def __init__(self, log_file, console, lock):
         self._log = log_file
         self.console = console
-        self._lock = threading.Lock()
+        # Shared by the stdout and stderr tees: they write to the same file,
+        # and separate locks would let their lines interleave.
+        self._lock = lock
 
     def write(self, text):
         with self._lock:
@@ -87,8 +89,9 @@ def install(config_dir, app_version):
     log_file.write(f"CrossPatch {app_version}, session started "
                    f"{datetime.datetime.now().isoformat(timespec='seconds')}\n")
     # A windowed build has no stdout at all (None): the tee then only logs.
-    sys.stdout = _Tee(log_file, sys.stdout)
-    sys.stderr = _Tee(log_file, sys.stderr)
+    lock = threading.Lock()
+    sys.stdout = _Tee(log_file, sys.stdout, lock)
+    sys.stderr = _Tee(log_file, sys.stderr, lock)
     return _log_path
 
 

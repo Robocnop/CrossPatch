@@ -13,7 +13,9 @@
 # the in-app updater uses to unpack this archive, writes symlinks as text.
 
 # ---------------------------------------------------------------- stage 1
-FROM python:3.12-slim-bullseye AS builder
+# The release is x86-64 only; pinning the platform keeps an ARM host from
+# silently producing an ARM binary under an x64 name.
+FROM --platform=linux/amd64 python:3.12-slim-bullseye AS builder
 
 # bullseye-security's live pool no longer serves the .deb versions its own index
 # advertises (mesa 404s), which breaks apt outright. The image already ships the
@@ -83,7 +85,7 @@ RUN set -eux; \
     test "$rc" = "124" || (echo "FATAL: app did not stay running (exit $rc)" && exit 1)
 
 # ---------------------------------------------------------------- stage 2
-FROM debian:bullseye-slim AS packager
+FROM --platform=linux/amd64 debian:bullseye-slim AS packager
 # Same stale-pool problem as stage 1; the sed is a no-op if the lines differ.
 RUN sed -i \
         -e 's|^deb http://deb.debian.org|# deb http://deb.debian.org|' \

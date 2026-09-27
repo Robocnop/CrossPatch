@@ -201,7 +201,7 @@ CrossPatch ships in **English** and **French** and follows your system language;
 
 To add a language, copy `assets/locales/en.json`, rename it after the language code (`de.json`, `es.json`,
 `pt_BR.json`...), translate the values and set `_meta.name` to the language's own name. Drop it in the
-*translations* folder listed [above](#how-it-works) and restart: it appears in the list, survives updates, and
+`locales` folder listed [above](#how-it-works) and restart: it appears in the list, survives updates, and
 any key you leave out falls back to English. Pull requests adding a language are welcome.
 
 ## Building from source

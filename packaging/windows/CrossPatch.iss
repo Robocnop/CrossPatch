@@ -74,12 +74,9 @@ en.LaunchApp=Launch {#AppName}
 fr.LaunchApp=Lancer {#AppName}
 en.AppRunning={#AppName} is running. Close it, then click Retry.
 fr.AppRunning={#AppName} est ouvert. Fermez-le, puis cliquez sur Réessayer.
-en.OneClick=Open GameBanana 1-Click Install links with CrossPatch
-fr.OneClick=Ouvrir les liens 1-Click Install de GameBanana avec CrossPatch
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
-Name: "oneclick"; Description: "{cm:OneClick}"
 
 [InstallDelete]
 ; Upgrades: PyInstaller's runtime folder is replaced as a whole, so a library
@@ -96,11 +93,12 @@ Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopicon
 
 [Registry]
-; CrossPatch also registers this itself at startup; doing it here as well means
-; 1-Click links work before the first launch and are cleaned up on uninstall.
-Root: HKA; Subkey: "Software\Classes\crosspatch"; ValueType: string; ValueName: ""; ValueData: "URL:CrossPatch Protocol"; Flags: uninsdeletekey; Tasks: oneclick
-Root: HKA; Subkey: "Software\Classes\crosspatch"; ValueType: string; ValueName: "URL Protocol"; ValueData: ""; Tasks: oneclick
-Root: HKA; Subkey: "Software\Classes\crosspatch\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""; Tasks: oneclick
+; Not optional: CrossPatch registers this itself at every start anyway. Doing it
+; here as well makes 1-Click links work before the first launch and removes
+; them on uninstall.
+Root: HKA; Subkey: "Software\Classes\crosspatch"; ValueType: string; ValueName: ""; ValueData: "URL:CrossPatch Protocol"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\crosspatch"; ValueType: string; ValueName: "URL Protocol"; ValueData: ""
+Root: HKA; Subkey: "Software\Classes\crosspatch\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchApp}"; Flags: nowait postinstall skipifsilent
