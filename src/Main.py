@@ -36,8 +36,25 @@ if __name__ == "__main__":
         # Exit this new instance
         sys.exit(0)
 
-    # This is the primary instance.
+    # This is the primary instance. Logging starts only now: a second instance
+    # rotating the log files would pull the running one's log from under it.
+    import Logs
+    from Constants import APP_VERSION
+    Logs.install(Config.CONFIG_DIR, APP_VERSION)
+
+    # Held for the whole session: the Windows installer waits on it before
+    # replacing files, so an update never copies over a running executable.
+    if platform.system() == "Windows":
+        import ctypes
+        _running_mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "CrossPatch.Running")
+
     Config.register_url_protocol()
+
+    # Must be set before the QApplication exists to have any effect.
+    scale = Config.ui_scale_factor()
+    if scale and scale != 1.0 and "QT_SCALE_FACTOR" not in os.environ:
+        os.environ["QT_SCALE_FACTOR"] = f"{scale:g}"
+        print(f"Interface scale set to {scale:g}.")
 
     app = QApplication(sys.argv)
     Localization.ensure_initialized()
@@ -136,4 +153,7 @@ if __name__ == "__main__":
         print("Auto-updater is disabled via CROSSPATCH_DISABLE_UPDATES environment variable.")
 
     window.show()
+    # Queued so the main window is on screen behind the welcome dialog.
+    from PySide6.QtCore import QTimer
+    QTimer.singleShot(0, window.maybe_show_welcome)
     sys.exit(app.exec())

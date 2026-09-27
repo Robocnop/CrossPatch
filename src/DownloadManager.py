@@ -162,10 +162,31 @@ class DownloadManager:
         thread_args = (download_url, item_type, item_id, file_ext, page_url)
         self._setup_and_start_thread(self._schema_download_thread, thread_args, dialog_title, dialog_file_name)
 
-    def _start_progress_dialog(self, title, file_name):
-        """DEPRECATED: This is now handled by _setup_and_start_thread."""
-        pass
-        
+    def install_local_archive(self, archive_path, folder_name):
+        """Installs a .zip/.7z/.rar the user dropped on the mod list."""
+        title = tr("dl.title.local", name=os.path.basename(archive_path))
+        self._setup_and_start_thread(self._local_archive_thread, (archive_path, folder_name),
+                                     title, os.path.basename(archive_path))
+
+    def _local_archive_thread(self, archive_path, folder_name):
+        try:
+            self._ensure_mods_folder()
+            self.signals.label_text.emit(tr("dl.extracting"))
+            extract_path = os.path.join(self.mods_folder, folder_name)
+            Util.extract_archive(archive_path, extract_path, self.signals.label_text)
+            # No GameBanana page is known, so the mod starts with its archive
+            # name; Edit Mod Info can add the rest later.
+            self._create_and_update_mod_info(
+                extract_path,
+                {'_sName': folder_name},
+                {'_sFile': os.path.basename(archive_path)},
+                page_url="",
+            )
+            self.signals.progress.emit(100)
+            self.signals.finished.emit()
+        except Exception as e:
+            self.signals.error.emit(tr("dl.error", error=e))
+
     def _ensure_mods_folder(self):
         """Creates the destination folder before anything is written to it.
 

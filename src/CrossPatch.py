@@ -2,7 +2,6 @@ import os
 import ctypes
 import threading
 import platform
-import requests
 import subprocess
 import sys
 import json
@@ -15,12 +14,12 @@ from PySide6.QtWidgets import (
     QDialog, QTableWidget, QTableWidgetItem, QGridLayout,
     QMessageBox, QFileDialog, QInputDialog
 )
-from PySide6.QtGui import QIcon, QAction, QFont, QDrag, QPixmap, QPainter, QColor, QDesktopServices, QImage, QDropEvent, QShortcut, QKeySequence, QMouseEvent
+from PySide6.QtGui import QIcon, QAction, QFont, QDrag, QPixmap, QPainter, QColor, QDesktopServices, QDropEvent, QShortcut, QKeySequence, QMouseEvent
 from PySide6.QtCore import Qt, QMimeData, QPoint, Signal, QObject, QUrl, QSize, QThread, QTimer, QRunnable, QThreadPool, QEvent
 
 from Credits import CreditsWindow
 from ModUpdatePrompt import ModUpdatePromptWindow
-from DownloadManager import DownloadManager
+from DownloadManager import DownloadManager, safe_name
 from ConflictDialog import ConflictDialog
 from FileSelectDialog import FileSelectDialog
 from OneClickInstallDialog import OneClickInstallDialog
@@ -35,6 +34,14 @@ import ProfileSharing
 from Localization import tr
 from Constants import APP_TITLE, APP_VERSION
 import PakInspector
+import ImageCache
+import ProtocolLinks
+import ModList
+import Backup
+import Logs
+from ConflictOverviewDialog import ConflictOverviewDialog
+from ModUpdates import UpdateAllRunner
+from WelcomeDialog import WelcomeDialog
 
 class WorkerSignals(QObject):
     """Defines signals available from a running worker thread."""
@@ -54,11 +61,9 @@ class ImageLoader(QRunnable):
     def run(self):
         """Downloads an image and emits it as a QPixmap."""
         try:
-            response = requests.get(self.url, headers={'User-Agent': Util.BROWSER_USER_AGENT}, timeout=10)
-            response.raise_for_status()
-            image = QImage()
-            image.loadFromData(response.content)
-            self.signals.result.emit(image)
+            # Cached, so paging back and forth does not download every
+            # thumbnail again.
+            self.signals.result.emit(ImageCache.fetch_image(self.url))
         except Exception as e:
             self.signals.error.emit((e, f"Failed to load image from {self.url}: {e}"))
         finally:
@@ -86,7 +91,7 @@ class ModDetailsLoader(QRunnable):
 
 # --- Custom Mod Card Widget ---
 class ModCard(QFrame):
-    def __init__(self, mod_data, download_callback, parent=None):
+    def __init__(self, mod_data, download_callback, installed=False, parent=None):
         super().__init__(parent)
         self.mod_data = mod_data
         self.download_callback = download_callback
@@ -130,8 +135,14 @@ class ModCard(QFrame):
         stats_layout.addStretch()
         layout.addLayout(stats_layout)
 
+        if installed:
+            installed_label = QLabel(tr("card.installed"))
+            installed_label.setStyleSheet("color: springgreen; font-weight: bold;")
+            stats_layout.addWidget(installed_label)
+
         # Download Button
-        download_btn = QPushButton(self.style().standardIcon(QStyle.SP_ArrowDown), tr("card.download"))
+        download_btn = QPushButton(self.style().standardIcon(QStyle.SP_ArrowDown),
+                                   tr("card.reinstall") if installed else tr("card.download"))
         download_btn.clicked.connect(self.on_download_clicked)
         layout.addWidget(download_btn)
 
@@ -204,8 +215,39 @@ class ModTreeWidget(QTreeWidget):
     """A custom QTreeWidget that forces all drops to be insertions, not parenting."""
     # Custom signal to be emitted after a successful drag-and-drop reorder.
     orderChanged = Signal()
+    # Archives dragged in from the file explorer, as local paths.
+    archivesDropped = Signal(list)
+
+    ARCHIVE_EXTENSIONS = (".zip", ".7z", ".rar")
+
+    def _dropped_archives(self, event):
+        mime = event.mimeData()
+        if not mime.hasUrls():
+            return []
+        return [url.toLocalFile() for url in mime.urls()
+                if url.isLocalFile() and url.toLocalFile().lower().endswith(self.ARCHIVE_EXTENSIONS)]
+
+    def dragEnterEvent(self, event):
+        # InternalMove rejects anything coming from outside the widget, so
+        # archives have to be accepted explicitly.
+        if self._dropped_archives(event):
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        if self._dropped_archives(event):
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
 
     def dropEvent(self, event: QDropEvent):
+        archives = self._dropped_archives(event)
+        if archives:
+            event.acceptProposedAction()
+            self.archivesDropped.emit(archives)
+            return
+
         if not self.selectedItems():
             return
 
@@ -253,6 +295,8 @@ class CrossPatchWindow(QMainWindow):
     mod_processing_finished = Signal(list, dict, bool, bool) # (new_priority_list, conflicts, launch_success, is_launch_operation)
     # Signal for app update check
     update_check_finished = Signal(str, dict)
+    # GameBanana categories for the browse filter, fetched in the background
+    browse_categories_loaded = Signal(object)
 
     # Tabs are identified by index, never by label: the label changes with the
     # interface language, which used to silently disable the buttons, the
@@ -260,6 +304,9 @@ class CrossPatchWindow(QMainWindow):
     TAB_MODS = 0
     TAB_BROWSE = 1
     TAB_SETTINGS = 2
+
+    # GameBanana game id of Sonic Racing CrossWorlds.
+    GB_GAME_ID = 21640
 
     def __init__(self, instance_socket=None):
         super().__init__()
@@ -338,6 +385,7 @@ class CrossPatchWindow(QMainWindow):
         self.mod_update_check_finished.connect(self.on_mod_update_check_finished)
         self.mod_processing_finished.connect(self._on_mod_processing_finished)
         self.update_check_finished.connect(self.on_app_update_check_finished)
+        self.browse_categories_loaded.connect(self._on_browse_categories_loaded)
         if self.instance_socket:
             threading.Thread(target=self._socket_listener, daemon=True).start()
 
@@ -385,6 +433,32 @@ class CrossPatchWindow(QMainWindow):
         mods_layout.addWidget(self.search_frame)
         self.search_frame.hide()
 
+        # Filters, counts and the list-wide actions.
+        filter_bar = QHBoxLayout()
+        filter_bar.addWidget(QLabel(tr("mods.filter")))
+        self.filter_selector = QComboBox()
+        for key in ModList.FILTERS:
+            self.filter_selector.addItem(tr(f"mods.filter.{key}"), key)
+        self.filter_selector.currentIndexChanged.connect(lambda _: self._update_treeview())
+        filter_bar.addWidget(self.filter_selector)
+        self.mod_count_label = QLabel()
+        self.mod_count_label.setToolTip(tr("mods.drop_hint"))
+        filter_bar.addWidget(self.mod_count_label)
+        filter_bar.addStretch()
+
+        self.update_all_btn = QPushButton(tr("mods.update_all"))
+        self.update_all_btn.setToolTip(tr("mods.update_all.tip"))
+        self.update_all_btn.clicked.connect(self.update_all_mods)
+        self.update_all_btn.hide()
+        filter_bar.addWidget(self.update_all_btn)
+
+        self.conflicts_btn = QPushButton(tr("mods.conflicts"))
+        self.conflicts_btn.setToolTip(tr("mods.conflicts.tip"))
+        self.conflicts_btn.clicked.connect(self.open_conflict_overview)
+        filter_bar.addWidget(self.conflicts_btn)
+        mods_layout.addLayout(filter_bar)
+        self._conflict_map = {}
+
         # Mods List (Treeview)
         self.tree = ModTreeWidget()
         self.tree.setColumnCount(7)
@@ -408,6 +482,7 @@ class CrossPatchWindow(QMainWindow):
 
         # Connect to the custom signal for drag-and-drop reordering.
         self.tree.orderChanged.connect(self.on_drag_end)
+        self.tree.archivesDropped.connect(self.install_dropped_archives)
         self.tree.viewport().setAcceptDrops(True)
         self.tree.viewport().setMouseTracking(True) # For hover cursor changes
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -423,7 +498,19 @@ class CrossPatchWindow(QMainWindow):
 
         # --- Filters and Search ---
         filter_bar = QHBoxLayout()
-        filter_bar.addWidget(QLabel(tr("browse.featured")))
+        self.browse_sort_selector = QComboBox()
+        self.browse_sort_selector.addItem(tr("browse.sort.Featured"), "Featured")
+        for sort in Util.GB_INDEX_SORTS:
+            self.browse_sort_selector.addItem(tr(f"browse.sort.{sort}"), sort)
+        self.browse_sort_selector.activated.connect(lambda _: self.fetch_browse_mods(page=1))
+        filter_bar.addWidget(self.browse_sort_selector)
+
+        self.browse_category_selector = QComboBox()
+        self.browse_category_selector.addItem(tr("browse.category.all"), None)
+        self.browse_category_selector.setToolTip(tr("browse.category.tip"))
+        self.browse_category_selector.activated.connect(lambda _: self.fetch_browse_mods(page=1))
+        filter_bar.addWidget(self.browse_category_selector)
+        self._browse_categories_requested = False
 
         filter_bar.addStretch()
 
@@ -567,6 +654,20 @@ class CrossPatchWindow(QMainWindow):
         language_layout.addWidget(self.language_selector)
         paths_layout.addLayout(language_layout)
 
+        # Interface scale, mostly for the Steam Deck's small screen.
+        scale_layout = QHBoxLayout()
+        scale_layout.addWidget(QLabel(tr("settings.ui_scale")))
+        self.ui_scale_selector = QComboBox()
+        for value in Config.UI_SCALES:
+            label = tr("settings.ui_scale.auto") if value == "auto" else f"{float(value) * 100:.0f} %"
+            self.ui_scale_selector.addItem(label, value)
+        index = self.ui_scale_selector.findData(str(self.cfg.get("ui_scale", "auto")))
+        self.ui_scale_selector.setCurrentIndex(index if index != -1 else 0)
+        self.ui_scale_selector.setToolTip(tr("settings.ui_scale.tip"))
+        self.ui_scale_selector.activated.connect(self.on_change_ui_scale)
+        scale_layout.addWidget(self.ui_scale_selector)
+        paths_layout.addLayout(scale_layout)
+
         settings_layout.addWidget(paths_frame)
 
         # --- Other Settings ---
@@ -585,6 +686,22 @@ class CrossPatchWindow(QMainWindow):
         ignored_btn.setToolTip(tr("settings.ignored_conflicts.tip"))
         ignored_btn.clicked.connect(self.open_ignored_conflicts)
         other_layout.addWidget(ignored_btn)
+
+        backup_row = QHBoxLayout()
+        backup_btn = QPushButton(tr("settings.backup"))
+        backup_btn.setToolTip(tr("settings.backup.tip"))
+        backup_btn.clicked.connect(self.backup_settings)
+        backup_row.addWidget(backup_btn)
+        restore_btn = QPushButton(tr("settings.restore"))
+        restore_btn.setToolTip(tr("settings.restore.tip"))
+        restore_btn.clicked.connect(self.restore_settings)
+        backup_row.addWidget(restore_btn)
+        other_layout.addLayout(backup_row)
+
+        logs_btn = QPushButton(tr("settings.open_logs"))
+        logs_btn.setToolTip(tr("settings.open_logs.tip"))
+        logs_btn.clicked.connect(self.open_logs_folder)
+        other_layout.addWidget(logs_btn)
 
         settings_layout.addWidget(other_frame)
 
@@ -683,7 +800,17 @@ class CrossPatchWindow(QMainWindow):
         font.setPointSize(12)
         launch_btn.setFont(font)
         self.launch_btn = launch_btn # Store as instance variable
-        self.centralWidget().layout().addWidget(self.launch_btn)
+
+        vanilla_btn = QPushButton(tr("bottom.launch_vanilla"))
+        vanilla_btn.setToolTip(tr("bottom.launch_vanilla_tip"))
+        vanilla_btn.clicked.connect(self.launch_vanilla)
+
+        launch_row = QWidget()
+        launch_layout = QHBoxLayout(launch_row)
+        launch_layout.setContentsMargins(0, 0, 0, 0)
+        launch_layout.addWidget(self.launch_btn, 1)
+        launch_layout.addWidget(vanilla_btn)
+        self.centralWidget().layout().addWidget(launch_row)
 
         # --- Status Bar ---
         # Changed it to a label cause I couldn't figure out how to center the text, might be a skill issue
@@ -718,9 +845,12 @@ class CrossPatchWindow(QMainWindow):
     def closeEvent(self, event):
         """Saves window size and closes the application."""
         self._is_closing = True
-        print("Saving configuration before exiting...")
-        self.cfg["window_geometry"] = self.saveGeometry().toHex().data().decode()
-        self.profile_manager.save()
+        if getattr(self, "_skip_save_on_close", False):
+            print("Settings were restored from a backup; not saving over them.")
+        else:
+            print("Saving configuration before exiting...")
+            self.cfg["window_geometry"] = self.saveGeometry().toHex().data().decode()
+            self.profile_manager.save()
         if self.instance_socket:
             self.instance_socket.close()
         event.accept()
@@ -750,10 +880,20 @@ class CrossPatchWindow(QMainWindow):
         if self.notebook.currentIndex() == self.TAB_MODS:
             self.search_btn.toggle()
 
+    def _priority_from_tree(self):
+        """The full load order, with the rows on screen in their current order.
+
+        The tree may be showing a subset (search or filter), so its rows are
+        merged into the profile's order rather than replacing it.
+        """
+        visible = [self.tree.topLevelItem(i).data(0, Qt.UserRole) for i in range(self.tree.topLevelItemCount())]
+        full = self.profile_manager.get_active_profile().get("mod_priority", [])
+        return ModList.merge_visible_order(full, visible)
+
     def on_drag_end(self):
         """Finalizes the drag operation, saving the new order."""
         # The move is already visually done by QTreeWidget. We just need to save it.
-        new_priority = [self.tree.topLevelItem(i).data(0, Qt.UserRole) for i in range(self.tree.topLevelItemCount())]
+        new_priority = self._priority_from_tree()
         if self.profile_manager.get_active_profile().get("mod_priority") != new_priority:
             self.profile_manager.set_mod_priority(new_priority)
             print("New mod order saved.")
@@ -947,8 +1087,12 @@ class CrossPatchWindow(QMainWindow):
                 self.mod_processing_finished.emit(new_priority_list, {}, False, False)
             except Exception as e:
                 print(f"Error during refresh worker: {e}")
-                # Re-enable button and reset status on the main thread
-                QTimer.singleShot(0, lambda: (self.refresh_btn.setEnabled(True), self.status_label.setText(tr("status.idle", version=APP_VERSION))))
+                error = e
+                def ui_err():
+                    self.refresh_btn.setEnabled(True)
+                    self.status_label.setText(tr("status.idle", version=APP_VERSION))
+                    QMessageBox.critical(self, tr("ui.error.title"), tr("ui.error.body", error=error))
+                Util.run_on_ui(ui_err)
 
         threading.Thread(target=refresh_worker, daemon=True).start()
 
@@ -972,10 +1116,17 @@ class CrossPatchWindow(QMainWindow):
                     selected_mod_folder = current_item.data(0, Qt.UserRole)
 
             search_text = self.search_entry.text().lower()
+            filter_key = self.filter_selector.currentData() or ModList.FILTER_ALL
             active_profile = self.profile_manager.get_active_profile()
             enabled_mods_map = active_profile.get("enabled_mods", {})
             mod_priority = active_profile.get("mod_priority", [])
             updatable_mod_names = {v['name'] for v in self.updatable_mods.values()}
+            try:
+                self._conflict_map = ModList.collect_conflicts(self.cfg["mods_folder"], active_profile)
+            except Exception as e:
+                print(f"Could not compute mod conflicts: {e}")
+                self._conflict_map = {}
+            conflicting = ModList.conflicting_mods(self._conflict_map)
 
             # --- Sorting Logic ---
             enabled_mods_ordered = []
@@ -991,15 +1142,16 @@ class CrossPatchWindow(QMainWindow):
             for mod_folder_name in mod_priority:
                 info = all_mods_info.get(mod_folder_name, {})
                 name = info.get("name", mod_folder_name)
+                is_enabled = enabled_mods_map.get(mod_folder_name, False)
 
-                # Filter based on search text
-                version = info.get("version", "1.0")
-                author = info.get("author", "Unknown")
-                mod_type = info.get("mod_type", "pak").upper()
-                if search_text and not any(search_text in s.lower() for s in [name, version, author, mod_type]):
+                if not ModList.matches_search(search_text, info, mod_folder_name):
+                    continue
+                if not ModList.matches_filter(filter_key, info, is_enabled,
+                                              name in updatable_mod_names,
+                                              mod_folder_name in conflicting):
                     continue
 
-                if enabled_mods_map.get(mod_folder_name, False):
+                if is_enabled:
                     enabled_mods_ordered.append(mod_folder_name)
                 else:
                     disabled_mods_with_info.append((name, mod_folder_name))
@@ -1053,10 +1205,21 @@ class CrossPatchWindow(QMainWindow):
                 if has_config:
                     item.setText(6, "⚙️")
 
+                if mod_folder_name in conflicting:
+                    item.setForeground(2, QColor("orange"))
+                    item.setToolTip(2, tr("mods.conflict_tip"))
+
                 self.tree.addTopLevelItem(item)
 
                 if mod_folder_name == selected_mod_folder:
                     self.tree.setCurrentItem(item)
+
+            enabled_count = sum(1 for m in mod_priority if enabled_mods_map.get(m, False))
+            self.mod_count_label.setText(tr("mods.count", shown=len(display_order),
+                                            total=len(mod_priority), enabled=enabled_count))
+            self.update_all_btn.setVisible(bool(self.updatable_mods))
+            self.conflicts_btn.setText(tr("mods.conflicts.count", count=len(conflicting))
+                                       if conflicting else tr("mods.conflicts"))
 
             print("Treeview updated")
             try:
@@ -1083,7 +1246,7 @@ class CrossPatchWindow(QMainWindow):
         else:
             # Capture current_priority from the UI thread before starting the worker.
             # This ensures we save the user's latest drag-and-drop changes.
-            current_priority = [self.tree.topLevelItem(i).data(0, Qt.UserRole) for i in range(self.tree.topLevelItemCount())]
+            current_priority = self._priority_from_tree()
 
         # Before starting the worker, explicitly save the profile data which now
         # contains any pending checkbox changes.
@@ -1107,8 +1270,12 @@ class CrossPatchWindow(QMainWindow):
             self.mod_processing_finished.emit(new_priority_list, conflicts, launch_success, True)
         except Exception as e:
             print(f"Error during save and launch worker: {e}")
-            QTimer.singleShot(0, lambda: QMessageBox.critical(self, tr("ui.error.title"), tr("ui.error.body", error=e)))
-            QTimer.singleShot(0, lambda: (self.launch_btn.setEnabled(True), self.status_label.setText(tr("status.idle", version=APP_VERSION))))
+            error = e
+            def ui_err():
+                self.launch_btn.setEnabled(True)
+                self.status_label.setText(tr("status.idle", version=APP_VERSION))
+                QMessageBox.critical(self, tr("ui.error.title"), tr("ui.error.body", error=error))
+            Util.run_on_ui(ui_err)
 
     def _on_mod_processing_finished(self, new_priority_list, conflicts, launch_success, is_launch_operation):
         """
@@ -1439,6 +1606,188 @@ class CrossPatchWindow(QMainWindow):
         else:
             QMessageBox.warning(self, tr("mods.folder_missing.title"), tr("mods.folder_missing.body", path=folder))
 
+    # --- Drag & drop install, bulk updates, conflicts, vanilla launch ---
+
+    def install_dropped_archives(self, paths):
+        """Installs archives dropped on the list, one after another."""
+        self._drop_queue = list(paths)
+        self._install_next_dropped()
+
+    def _install_next_dropped(self):
+        while getattr(self, "_drop_queue", None):
+            path = self._drop_queue.pop(0)
+            stem = os.path.splitext(os.path.basename(path))[0]
+            folder = safe_name(stem, "Dropped_Mod")
+            target = os.path.join(self.cfg["mods_folder"], folder)
+            if os.path.exists(target):
+                reply = QMessageBox.question(
+                    self, tr("drop.exists.title"), tr("drop.exists.body", name=folder),
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                if reply != QMessageBox.Yes:
+                    continue
+            self.active_download_manager = DownloadManager(
+                self, self.cfg["mods_folder"], on_complete=self._on_dropped_installed, refresh_browse=False)
+            self.active_download_manager.install_local_archive(path, folder)
+            return
+
+    def _on_dropped_installed(self):
+        self.refresh()
+        if getattr(self, "_drop_queue", None):
+            self._install_next_dropped()
+        else:
+            self.status_label.setText(tr("drop.done"))
+
+    def update_all_mods(self):
+        if not self.updatable_mods:
+            return
+        names = "\n".join(f"- {u['name']}: {u['current']} → {u['new']}" for u in self.updatable_mods.values())
+        reply = QMessageBox.question(self, tr("modupdate.all.title"),
+                                     tr("modupdate.all.body", count=len(self.updatable_mods), names=names))
+        if reply != QMessageBox.Yes:
+            return
+        self.update_all_btn.setEnabled(False)
+        self._update_runner = UpdateAllRunner(self, dict(self.updatable_mods), self.cfg["mods_folder"],
+                                              self.profile_manager.get_active_profile())
+        self._update_runner.progress.connect(self.status_label.setText)
+        self._update_runner.finished.connect(self._on_update_all_finished)
+        self._update_runner.start()
+
+    def _on_update_all_finished(self, results):
+        self._update_runner = None
+        self.update_all_btn.setEnabled(True)
+        self.status_label.setText(tr("status.idle", version=APP_VERSION))
+        failed = [(name, err) for name, err in results if err]
+        body = tr("modupdate.all.done", updated=len(results) - len(failed))
+        if failed:
+            body += tr("modupdate.all.failed", names="\n".join(f"- {n}: {e}" for n, e in failed))
+        QMessageBox.information(self, tr("modupdate.all.title"), body)
+        self.refresh()
+
+    def _display_names(self):
+        names = {}
+        for mod in self.profile_manager.get_active_profile().get("mod_priority", []):
+            names[mod] = Util.read_mod_info(os.path.join(self.cfg["mods_folder"], mod)).get("name", mod)
+        return names
+
+    def open_conflict_overview(self):
+        profile = self.profile_manager.get_active_profile()
+        # The overview works on the saved profile, so take in any unsaved
+        # drag-and-drop first.
+        self.profile_manager.set_mod_priority(self._priority_from_tree())
+        groups = ModList.group_conflicts(ModList.collect_conflicts(self.cfg["mods_folder"], profile))
+
+        def load_last(mod, others):
+            new_order = ModList.load_after(profile.get("mod_priority", []), mod, others)
+            self.profile_manager.set_mod_priority(new_order)
+            return ModList.group_conflicts(ModList.collect_conflicts(self.cfg["mods_folder"], profile))
+
+        dialog = ConflictOverviewDialog(self, groups, self._display_names(), load_last)
+        dialog.exec()
+        if dialog.changed:
+            self._update_treeview()
+            reply = QMessageBox.question(self, tr("conflicts.overview.title"), tr("conflicts.overview.apply_now"))
+            if reply == QMessageBox.Yes:
+                self.save_and_apply_mods(use_profile_priority=True)
+
+    def launch_vanilla(self):
+        """Removes the installed mods from the game, then starts it."""
+        reply = QMessageBox.question(self, tr("vanilla.title"), tr("vanilla.body"),
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            removed = Util.uninstall_all_mods(self.cfg)
+        except Exception as e:
+            QMessageBox.critical(self, tr("vanilla.title"), tr("vanilla.failed", error=e))
+            return
+        print(f"Removed {removed} installed mod folder(s) for a vanilla launch.")
+        self.status_label.setText(tr("vanilla.status"))
+        if not Util.launch_game():
+            QMessageBox.warning(self, tr("launch.failed.title"), tr("launch.failed.body"))
+
+    # --- Settings: backups, logs, interface scale, welcome ---
+
+    def backup_settings(self):
+        # Checkbox changes only live in memory until something saves them.
+        self.profile_manager.save()
+        suggested = os.path.join(os.path.expanduser("~"), Backup.suggested_file_name())
+        path, _ = QFileDialog.getSaveFileName(self, tr("backup.title"), suggested, tr("backup.filter"))
+        if not path:
+            return
+        try:
+            Backup.create_backup(path)
+        except Exception as e:
+            QMessageBox.critical(self, tr("backup.title"), tr("backup.failed", error=e))
+            return
+        QMessageBox.information(self, tr("backup.title"), tr("backup.done", path=path))
+
+    def restore_settings(self):
+        path, _ = QFileDialog.getOpenFileName(self, tr("restore.title"), Backup.BACKUP_DIR, tr("backup.filter"))
+        if not path:
+            return
+        reply = QMessageBox.question(self, tr("restore.title"), tr("restore.confirm"),
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            safety = Backup.restore_backup(path)
+        except ValueError as e:
+            QMessageBox.critical(self, tr("restore.title"), tr("restore.invalid", error=e))
+            return
+        except Exception as e:
+            QMessageBox.critical(self, tr("restore.title"), tr("restore.failed", error=e))
+            return
+        QMessageBox.information(self, tr("restore.title"), tr("restore.done", path=safety))
+        # The settings on disk are the restored ones now; closing normally
+        # would write the old ones from memory back over them.
+        self._skip_save_on_close = True
+        self._restart()
+
+    def _restart(self):
+        if Config.is_packaged():
+            args = [sys.executable]
+        else:
+            args = [sys.executable, os.path.abspath(sys.argv[0])]
+        # Free the single-instance port first, or the new process would hand
+        # over to this one and exit.
+        if self.instance_socket:
+            self.instance_socket.close()
+            self.instance_socket = None
+        subprocess.Popen(args, **PakInspector._subprocess_flags())
+        self.close()
+
+    def open_logs_folder(self):
+        folder = Logs.log_dir() or Config.CONFIG_DIR
+        QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+
+    def on_change_ui_scale(self):
+        value = self.ui_scale_selector.currentData()
+        if value == self.cfg.get("ui_scale", "auto"):
+            return
+        self.cfg["ui_scale"] = value
+        Config.save_config(self.cfg)
+        QMessageBox.information(self, tr("settings.ui_scale"), tr("settings.ui_scale.restart"))
+
+    def _set_game_root(self, new_root):
+        """Updates the game folder and every path derived from it."""
+        self.cfg["game_root"] = new_root
+        self.cfg["game_mods_folder"] = os.path.join(new_root, "UNION", "Content", "Paks", "~mods")
+        # The UE4SS folders used to keep pointing at the old game folder.
+        self.cfg["ue4ss_mods_folder"] = os.path.join(new_root, "UNION", "Binaries", "Win64", "ue4ss", "Mods")
+        self.cfg["ue4ss_logic_mods_folder"] = os.path.join(new_root, "UNION", "Content", "Paks", "LogicMods")
+        self.game_root_var.setText(new_root)
+        Config.save_config(self.cfg)
+
+    def maybe_show_welcome(self):
+        if self.cfg.get("first_run_done", True):
+            return
+        dialog = WelcomeDialog(self, dict(self.cfg), PakInspector.parser_works())
+        dialog.exec()
+        if dialog.game_root_changed:
+            self._set_game_root(dialog.cfg["game_root"])
+        self.cfg["first_run_done"] = True
+        Config.save_config(self.cfg)
+
     def detect_mod_conflicts(self):
         mods_folder = self.cfg["mods_folder"]
         active_profile = self.profile_manager.get_active_profile()
@@ -1473,23 +1822,31 @@ class CrossPatchWindow(QMainWindow):
         self.activateWindow() # Bring window to front
         self.raise_()
 
+        if not url.strip().lower().startswith("crosspatch:"):
+            # Not a link at all (a file dropped on the executable, say), which
+            # was always ignored.
+            print(f"Ignoring a startup argument that is not a crosspatch: link: {url}")
+            return
         try:
-            if url.startswith("crosspatch:") and "," in url:
-                parts_str = url.replace("crosspatch:", "")
-                parts = parts_str.split(',')
-                download_url, item_type, item_id = parts[0], parts[1], parts[2]
-                file_ext = parts[3] if len(parts) > 3 else 'zip'
-                gb_page_url = f"https://gamebanana.com/{item_type.lower()}s/{item_id}"
+            link = ProtocolLinks.parse(url)
+        except ValueError as e:
+            QMessageBox.warning(self, tr("protocol.error.title"), tr("protocol.rejected.body", error=e))
+            return
+
+        try:
+            if link["kind"] == "schema":
+                gb_page_url = link["page_url"]
                 item_data = Util.get_gb_item_data_from_url(gb_page_url)
 
                 dialog = OneClickInstallDialog(self, item_data)
                 if dialog.exec():
                     self.active_download_manager = DownloadManager(self, self.cfg["mods_folder"], on_complete=self.refresh)
-                    self.active_download_manager.download_from_schema(download_url, item_type, item_id, file_ext, page_url=gb_page_url)
+                    self.active_download_manager.download_from_schema(
+                        link["download_url"], link["item_type"], link["item_id"],
+                        link["file_ext"], page_url=gb_page_url)
 
-            elif url.startswith("crosspatch://install?url="):
-                gb_url = url.replace("crosspatch://install?url=", "")
-                item_data = Util.get_gb_item_data_from_url(gb_url)
+            else:
+                item_data = Util.get_gb_item_data_from_url(link["page_url"])
                 dialog = OneClickInstallDialog(self, item_data)
                 if dialog.exec():
                     # This link carries only the page URL, so let the user pick
@@ -1565,10 +1922,7 @@ class CrossPatchWindow(QMainWindow):
     def on_change_game_root(self):
         new_root = QFileDialog.getExistingDirectory(self, "Select Crossworlds Install Folder", self.cfg["game_root"])
         if new_root:
-            self.game_root_var.setText(new_root)
-            self.cfg["game_root"] = new_root
-            self.cfg["game_mods_folder"] = os.path.join(new_root, "UNION", "Content", "Paks", "~mods")
-            Config.save_config(self.cfg)
+            self._set_game_root(new_root)
             print("Updated root folder")
 
     # --- Profile Management Methods ---
@@ -1738,6 +2092,24 @@ class CrossPatchWindow(QMainWindow):
         """Fetch initial mod data only when the 'Browse Mods' tab is selected for the first time."""
         if index == self.TAB_BROWSE and not self.browse_mods_data:
             self.fetch_browse_mods()
+        if index == self.TAB_BROWSE and not self._browse_categories_requested:
+            self._browse_categories_requested = True
+            threading.Thread(target=self._fetch_categories_worker, daemon=True).start()
+
+    def _fetch_categories_worker(self):
+        try:
+            self.browse_categories_loaded.emit(Util.get_gb_categories(self.GB_GAME_ID))
+        except Exception as e:
+            # The filter is optional; browsing keeps working without it.
+            print(f"Could not load the GameBanana categories: {e}")
+            self.browse_categories_loaded.emit([])
+
+    def _on_browse_categories_loaded(self, categories):
+        if not categories:
+            self._browse_categories_requested = False  # try again next visit
+            return
+        for category_id, name in categories:
+            self.browse_category_selector.addItem(name, category_id)
 
     def fetch_browse_mods(self, page=1):
         """Fetches and displays mods from GameBanana in a background thread."""
@@ -1753,20 +2125,20 @@ class CrossPatchWindow(QMainWindow):
         self.browse_prev_btn.setEnabled(page > 1)
 
         search_query = self.browse_search_entry.text().strip()
-        sort_param = "Featured" # Hardcoded to always use Featured
+        sort_param = self.browse_sort_selector.currentData() or "Featured"
+        category_id = self.browse_category_selector.currentData()
 
         print(f"[DEBUG] Starting worker thread with sort='{sort_param}', page={self.browse_current_page}, search='{search_query}'")
 
         threading.Thread(
             target=self._fetch_browse_mods_worker,
-            args=(sort_param, self.browse_current_page, search_query),
+            args=(sort_param, self.browse_current_page, search_query, category_id),
             daemon=True
         ).start()
 
-    def _fetch_browse_mods_worker(self, sort, page, search):
+    def _fetch_browse_mods_worker(self, sort, page, search, category_id=None):
         try:
-            # Game ID for "Sonic Racing Crossworlds"
-            game_id = 21640
+            game_id = self.GB_GAME_ID
             mods, metadata = [], {}
 
             # Search overrides all other filters and uses the Subfeed endpoint.
@@ -1775,6 +2147,11 @@ class CrossPatchWindow(QMainWindow):
                 metadata = dict(metadata or {})
                 metadata['_bApproximate'] = approximate
                 metadata['_sQuery'] = search
+            elif category_id or sort != "Featured":
+                # Featured has no category filter, so a category falls back
+                # to the newest mods in it.
+                index_sort = sort if sort in Util.GB_INDEX_SORTS else "Generic_Newest"
+                mods, metadata = Util.get_gb_mod_index(game_id, index_sort, page, category_id)
             else:
                 mods, metadata = Util.fetch_specialized_lists(game_id, sort, page)
 
@@ -1829,12 +2206,25 @@ class CrossPatchWindow(QMainWindow):
             self._set_browse_notice("")
         self.browse_mods_data = mods
 
+        installed = self._installed_page_keys()
+
         # Determine number of columns based on window width
         cols = max(1, self.scroll_area.width() // 230)
         for i, mod_data in enumerate(mods):
             row, col = divmod(i, cols)
-            card = ModCard(mod_data, self.add_mod_from_url)
+            is_installed = ProfileSharing.page_key(mod_data.get('_sProfileUrl') or "") in installed
+            card = ModCard(mod_data, self.add_mod_from_url, installed=is_installed)
             self.card_layout.addWidget(card, row, col)
+
+    def _installed_page_keys(self):
+        """'<type>/<id>' of every installed mod that came from GameBanana."""
+        keys = set()
+        for folder in Util.list_mod_folders(self.cfg["mods_folder"]):
+            key = ProfileSharing.page_key(
+                Util.read_mod_info(os.path.join(self.cfg["mods_folder"], folder)).get("mod_page"))
+            if key:
+                keys.add(key)
+        return keys
 
     def _reflow_browse_cards(self):
         """Rearranges existing mod cards to fit the new window size without fetching new data."""

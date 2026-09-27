@@ -126,13 +126,3 @@ class ProfileManager:
         # then add the selections for the specific mod.
         active_profile.setdefault("mod_configurations", {})[mod_name] = selections
         self.save()
-
-    def set_mod_configuration(self, mod_name, selections):
-        """
-        Sets the configuration selections for a specific mod in the active profile.
-        """
-        active_profile = self.get_active_profile()
-        # Use setdefault to create the 'mod_configurations' dict if it doesn't exist,
-        # then add the selections for the specific mod.
-        active_profile.setdefault("mod_configurations", {})[mod_name] = selections
-        self.save()
