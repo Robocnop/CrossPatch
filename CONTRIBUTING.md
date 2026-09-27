@@ -25,8 +25,8 @@ Good reports get fixed faster. Please include:
 - Your operating system, and for Linux your distribution and desktop session.
 - The CrossPatch version, shown in the title bar and in the credits window.
 - What you expected, and what happened instead.
-- The console log. Turn it on under **Settings > Show console logs**, restart
-  CrossPatch, reproduce the problem, then copy what the console printed.
+- The log file. **Settings > Open logs folder** opens it: attach `crosspatch.log`,
+  or `crosspatch.1.log` if CrossPatch has been restarted since the problem.
 
 If the problem involves a specific mod, a link to its GameBanana page helps a lot.
 
@@ -38,7 +38,7 @@ Windows, so anything in that range is safe.
 ```bash
 git clone https://github.com/Robocnop/CrossPatch
 cd CrossPatch
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 python src/Main.py
 ```
 
@@ -55,7 +55,9 @@ Two environment variables are useful while developing:
 | `CROSSPATCH_DISABLE_UPDATES=1` | Skips the update check on startup |
 
 Running from source already skips the updater, so it can never overwrite your
-working copy with a release build.
+working copy with a release build. It does register the `crosspatch://` link
+handler, pointing at your checkout; start the installed CrossPatch once to point
+1-Click links back at it.
 
 ## Where things live
 
@@ -65,6 +67,9 @@ working copy with a release build.
 | `src/Util.py` | Shared helpers: archives, GameBanana API, conflict detection |
 | `src/Config.py` | Settings, config directory, game folder detection |
 | `src/Updater.py` | The in-app updater |
+| `src/ModList.py` | Mod list logic without widgets: filters, conflict map, load order |
+| `tests/` | The automated tests, run with `python -m pytest` |
+| `packaging/` | Release build files: PyInstaller specs, the Linux Dockerfile and scripts |
 | `assets/locales/` | Interface translations |
 | `assets/themes/` | Qt stylesheets |
 | `tools/CrossPatchParser/` | The C# `.pak` analyser |
@@ -91,8 +96,15 @@ If you add a new string to the interface, add the key to **every** file in
 
 ## Writing code
 
-There is no linter and no formatter config, so match the surrounding code rather
-than any external style guide. A few things the project does care about:
+There is no formatter config, so match the surrounding code rather than any
+external style guide. The CI runs `ruff` with only the rules that catch real bugs
+(undefined names, a function defined twice, syntax errors):
+
+```bash
+python -m ruff check src tests --select E9,F63,F7,F82,F811
+```
+
+A few things the project does care about:
 
 **Never swallow an error the user needs to know about.** This codebase has been
 bitten repeatedly by failures that were caught, ignored, and left the user
@@ -118,8 +130,18 @@ that Linux is case sensitive.
 
 ## Testing your change
 
-There is no automated test suite yet, so testing is manual. Before opening a
-pull request, please check at least:
+Run the test suite first. It needs no game install and never touches your real
+settings:
+
+```bash
+python -m pytest
+```
+
+The same tests run on Windows and Linux for every pull request. Logic that needs
+no window belongs in a module like `ModList.py` or `ProtocolLinks.py`, where it
+can be tested; please add a test when you fix a bug there.
+
+The tests do not click through the interface, so please also check at least:
 
 - CrossPatch starts, and the mod list loads.
 - Enabling and disabling a mod still writes to the game folder correctly.

@@ -11,7 +11,7 @@ import platform
 import re
 import sys
 import threading
-from PySide6.QtCore import QEvent, QTimer
+from PySide6.QtCore import QEvent, QTimer, QObject, Signal, Qt
 from PySide6.QtWidgets import QApplication, QMessageBox, QDialog, QLabel, QVBoxLayout, QProgressBar
 
 from Constants import UPDATE_URL, APP_VERSION, STEAM_APP_ID
@@ -38,8 +38,8 @@ def load_ignored_conflicts():
         if os.path.exists(IGNORED_CONFLICTS_PATH):
             with open(IGNORED_CONFLICTS_PATH, "r", encoding="utf-8") as f:
                 return json.load(f)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Could not read the ignored conflicts list: {e}")
     return []
 
 
@@ -48,8 +48,8 @@ def save_ignored_conflicts(data):
         os.makedirs(CONFIG_DIR, exist_ok=True)
         with open(IGNORED_CONFLICTS_PATH, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Could not save the ignored conflicts list: {e}")
 
 
 def is_conflict_ignored(mod, provider):
@@ -73,6 +73,35 @@ class ModListFetchEvent(QEvent):
     def __init__(self, mods_data):
         super().__init__(self.EVENT_TYPE)
         self.mods_data = mods_data
+
+
+class _UiInvoker(QObject):
+    """Runs callables on the thread this object lives in, the GUI thread."""
+    call = Signal(object)
+
+    def __init__(self):
+        super().__init__()
+        self.call.connect(self._run, Qt.QueuedConnection)
+
+    def _run(self, fn):
+        try:
+            fn()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"Error in a UI callback: {e}")
+
+
+# Created at import time, which happens on the GUI thread, so its slot always
+# runs there. QTimer.singleShot called from a plain Python thread was used for
+# this before, but that thread has no Qt event loop and the callback never ran:
+# errors vanished and buttons stayed disabled.
+_UI_INVOKER = _UiInvoker()
+
+
+def run_on_ui(fn):
+    """Schedules fn() on the GUI thread. Safe to call from any thread."""
+    _UI_INVOKER.call.emit(fn)
 
 # --- Handle optional archive dependencies for UE4SS install ---
 try:
@@ -615,6 +644,41 @@ def fetch_specialized_lists(game_id, sort, page):
     return add_download_counts(mods), metadata
 
 
+# Sort orders of the Mod/Index endpoint, which unlike Subfeed honours a
+# category filter.
+GB_INDEX_SORTS = ("Generic_Newest", "Generic_LatestUpdated", "Generic_MostLiked",
+                  "Generic_MostDownloaded", "Generic_MostViewed")
+
+
+def get_gb_categories(game_id):
+    """[(id, name)] of the game's mod categories, alphabetical."""
+    resp = _gb_request("https://gamebanana.com/apiv11/Mod/Categories",
+                       params={'_idGameRow': game_id, '_sSort': 'a_to_z', '_bShowEmpty': 'true'},
+                       timeout=15)
+    rows = resp.json()
+    if not isinstance(rows, list):
+        raise ValueError(f"Unexpected category list from GameBanana: {rows}")
+    return [(row['_idRow'], row.get('_sName', str(row['_idRow'])))
+            for row in rows if isinstance(row, dict) and '_idRow' in row]
+
+
+def get_gb_mod_index(game_id, sort, page=1, category_id=None):
+    """Mods of the game in the given order, optionally within one category."""
+    if sort not in GB_INDEX_SORTS:
+        raise ValueError(f"Unknown sort order '{sort}'.")
+    params = {
+        '_nPage': page,
+        '_nPerpage': 15,
+        '_sSort': sort,
+        '_aFilters[Generic_Game]': game_id,
+    }
+    if category_id:
+        params['_aFilters[Generic_Category]'] = category_id
+    resp = _gb_request("https://gamebanana.com/apiv11/Mod/Index", params=params, timeout=15)
+    data = resp.json()
+    return add_download_counts(data.get('_aRecords', [])), data.get('_aMetadata', {})
+
+
 def fetch_remote_version():
     print("Fetching remote version from GitHub")
     try:
@@ -872,48 +936,6 @@ def has_file_based_configuration_quick(mod_path: str) -> bool:
         return False
 
 
-def _apply_mod_configuration(mod_install_path, mod_info, profile_data):
-    """Renames files within an installed mod folder based on configuration."""
-    config = mod_info.get("configuration")
-    if not config:
-        return
-
-    # This function is no longer needed with the new copy-on-select logic.
-    if True:
-        return
-
-    mod_name = os.path.basename(mod_install_path)
-    mod_configs = profile_data.get("mod_configurations", {}).get(mod_name, {})
-    
-    for category, options in config.items():
-        # Default to the first option if none is selected for the category
-        selected_option_folder = mod_configs.get(category, next(iter(options)))
-        
-        for option_folder_name in options.keys():
-            is_enabled = (option_folder_name == selected_option_folder)
-            source_option_path = os.path.join(mod_install_path, category, option_folder_name)
-            
-            if not os.path.isdir(source_option_path):
-                continue
-
-            for filename in os.listdir(source_option_path):
-                # Skip the description file itself
-                if filename.lower() == 'desc.ini':
-                    continue
-                
-                source_file = os.path.join(source_option_path, filename)
-                dest_file = os.path.join(mod_install_path, filename)
-                disabled_dest_file = f"{dest_file}_disabled"
-
-                if is_enabled:
-                    # If this is the selected option, ensure its files are enabled
-                    if os.path.exists(disabled_dest_file) and os.path.basename(disabled_dest_file) == f"{filename}_disabled":
-                         os.rename(disabled_dest_file, dest_file)
-                else:
-                    # If this is NOT the selected option, ensure its files are disabled
-                    if os.path.exists(dest_file):
-                        os.rename(dest_file, disabled_dest_file)
-
 def _require_game_path(cfg, key):
     """Returns cfg[key], refusing an empty value.
 
@@ -972,6 +994,36 @@ def clean_ue4ss_folders(cfg):
                             shutil.rmtree(item_path)
                 except Exception as e:
                     print(f"Error disabling UE4SS mod {item}: {e}")
+
+def uninstall_all_mods(cfg):
+    """Removes every CrossPatch-installed mod from the game folders.
+
+    The mods folder and the profile are left alone, so Save & Apply puts
+    everything back. Used to launch the game unmodded for a quick comparison.
+    Returns the number of folders removed.
+    """
+    removed = 0
+    pak_dst = get_game_mods_folder(cfg)
+    if os.path.isdir(pak_dst):
+        managed = re.compile(r"^\d{3,}\..+")
+        for item in os.listdir(pak_dst):
+            path = os.path.join(pak_dst, item)
+            if os.path.isdir(path) and managed.match(item):
+                shutil.rmtree(path)
+                removed += 1
+
+    known = set(list_mod_folders(cfg["mods_folder"]))
+    for key in ("ue4ss_mods_folder", "ue4ss_logic_mods_folder"):
+        folder = cfg.get(key)
+        if not folder or not os.path.isdir(folder):
+            continue
+        for item in os.listdir(folder):
+            path = os.path.join(folder, item)
+            if item in known and os.path.isdir(path):
+                shutil.rmtree(path)
+                removed += 1
+    return removed
+
 
 def remove_mod_from_game_folders(mod_name, cfg):
 
@@ -1278,7 +1330,8 @@ def start_background_parse(parent, mod_path, mod_name, cfg, profile_data):
         try:
             pak = PakInspector.generate_mod_pak_manifest(mod_path)
 
-            # Persist pak_data into info.json
+            # Persist pak_data into info.json. Without it conflict detection has
+            # nothing to compare, so a failure here is worth saying out loud.
             info_path = os.path.join(mod_path, "info.json")
             try:
                 if os.path.exists(info_path):
@@ -1289,23 +1342,14 @@ def start_background_parse(parent, mod_path, mod_name, cfg, profile_data):
                 info["pak_data"] = pak
                 with open(info_path, "w", encoding="utf-8") as f:
                     json.dump(info, f, indent=2)
-                # Update cache
-                try:
-                    mtime = os.path.getmtime(info_path)
-                    _READ_MOD_INFO_CACHE[info_path] = (mtime, info)
-                except Exception:
-                    pass
-            except Exception:
-                pass
+                _READ_MOD_INFO_CACHE[info_path] = (os.path.getmtime(info_path), info)
+            except Exception as e:
+                print(f"Could not save the pak analysis of '{mod_name}' to info.json: {e}")
 
-            # Schedule UI work on main thread
             def ui_done():
                 _BACKGROUND_PARSES.pop(mod_path, None)
-                try:
-                    if parent and hasattr(parent, 'refresh'):
-                        parent.refresh()
-                except Exception:
-                    pass
+                if parent and hasattr(parent, 'refresh'):
+                    parent.refresh()
 
                 # Run conflict detection now that pak_data is available
                 try:
@@ -1323,38 +1367,21 @@ def start_background_parse(parent, mod_path, mod_name, cfg, profile_data):
                                     add_ignored_conflict(mod_name, provider_mod)
                             elif action == "disable_providers":
                                 for provider_mod in selected:
-                                    try:
-                                        profile_data["enabled_mods"][provider_mod] = False
-                                    except Exception:
-                                        pass
-                                    try:
-                                        remove_mod_from_game_folders(provider_mod, cfg)
-                                    except Exception:
-                                        pass
+                                    profile_data.setdefault("enabled_mods", {})[provider_mod] = False
+                                    remove_mod_from_game_folders(provider_mod, cfg)
                             elif action == "rollback":
-                                try:
-                                    profile_data["enabled_mods"][mod_name] = False
-                                except Exception:
-                                    pass
-                                try:
-                                    remove_mod_from_game_folders(mod_name, cfg)
-                                except Exception:
-                                    pass
+                                profile_data.setdefault("enabled_mods", {})[mod_name] = False
+                                remove_mod_from_game_folders(mod_name, cfg)
                 except Exception as e:
-                    try:
-                        QMessageBox.warning(parent, tr("pakparse.error.title"), tr("pakparse.error.post", error=e))
-                    except Exception:
-                        pass
+                    QMessageBox.warning(parent, tr("pakparse.error.title"), tr("pakparse.error.post", error=e))
 
-            QTimer.singleShot(0, ui_done)
+            run_on_ui(ui_done)
         except Exception as e:
             _BACKGROUND_PARSES.pop(mod_path, None)
-            def ui_err():
-                try:
-                    QMessageBox.warning(parent, tr("pakparse.error.title"), tr("pakparse.error.background", name=mod_name, error=e))
-                except Exception:
-                    pass
-            QTimer.singleShot(0, ui_err)
+            error = e
+            run_on_ui(lambda: QMessageBox.warning(
+                parent, tr("pakparse.error.title"),
+                tr("pakparse.error.background", name=mod_name, error=error)))
 
     threading.Thread(target=worker, daemon=True).start()
 

@@ -145,8 +145,12 @@ def show_console():
                 open("CONOUT$", "w", buffering=1),
                 open("CONOUT$", "w", buffering=1)
             )
-            sys.stdout = _console_streams[0]
-            sys.stderr = _console_streams[1]
+            import Logs
+            # With the log file running, the console is added next to it
+            # rather than replacing it.
+            if not Logs.attach_console(*_console_streams):
+                sys.stdout = _console_streams[0]
+                sys.stderr = _console_streams[1]
             print("Welcome to CrossPatch's Console logs! If you're a regular user there's really no point in having this enabled\nYou should only use this for debugging purposes, serves no other purpose really")
     except Exception as e:
         print(f"Failed to show console: {e}")
@@ -159,14 +163,16 @@ def hide_console():
         return
     global _console_streams
     try:
-        sys.stdout = _original_stdout
-        sys.stderr = _original_stderr
+        import Logs
+        if not Logs.attach_console(_original_stdout, _original_stderr):
+            sys.stdout = _original_stdout
+            sys.stderr = _original_stderr
         if _console_streams:
             try:
                 _console_streams[0].close()
                 _console_streams[1].close()
-            except:
-                pass
+            except OSError as e:
+                print(f"Could not close the console streams: {e}")
             _console_streams = None
         ctypes.windll.kernel32.FreeConsole()
     except Exception as e:
@@ -231,6 +237,10 @@ def _apply_config_defaults(cfg):
         "mod_priority": [],
         "window_size": "580x720",
         "language": "auto",
+        "ui_scale": "auto",
+        # Anyone upgrading already knows the app; only a brand new config
+        # (see load_config) starts with the welcome screen pending.
+        "first_run_done": True,
     }
 
     changed = False
@@ -294,17 +304,60 @@ def load_config():
             "show_cmd_logs": False,
             "steam_detected": detected,
             "mod_priority": [],
-            "window_size": "580x720"
+            "window_size": "580x720",
+            "first_run_done": False,
         }
+        _apply_config_defaults(cfg)
         save_config(cfg)
         return cfg
     except SystemExit as e:
         # This happens if the user cancels a folder dialog during first-time setup.
         sys.exit(f"Configuration setup cancelled. {e}")
 
+UI_SCALES = ("auto", "1", "1.25", "1.5", "2")
+
+
+def is_steam_deck():
+    """True on SteamOS, where the 7" screen makes the default UI hard to use."""
+    if os.environ.get("SteamDeck") == "1":
+        return True
+    try:
+        with open("/etc/os-release", "r", encoding="utf-8") as f:
+            return any(line.strip() in ("ID=steamos", 'ID="steamos"') for line in f)
+    except OSError:
+        return False
+
+
+def ui_scale_factor():
+    """Interface scale to apply at startup, read straight from the config file.
+
+    Qt only honours QT_SCALE_FACTOR when it is set before the QApplication is
+    created, which is before load_config() runs, hence the direct read.
+    """
+    choice = "auto"
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            choice = str(json.load(f).get("ui_scale", "auto"))
+    except (OSError, ValueError, AttributeError):
+        pass
+
+    if choice == "auto":
+        return 1.5 if is_steam_deck() else 1.0
+    try:
+        value = float(choice)
+    except ValueError:
+        return 1.0
+    return value if 0.5 <= value <= 3 else 1.0
+
+
 def save_config(cfg):
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+    # Written beside the real file and swapped in: a crash or a full disk in
+    # the middle of json.dump used to leave a truncated config.json, and every
+    # profile with it.
+    tmp_path = CONFIG_FILE + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
+    os.replace(tmp_path, CONFIG_FILE)
 
 def register_url_protocol():
     """

@@ -1,7 +1,6 @@
 import sys
 import datetime
 import threading
-import requests
 from PySide6.QtWidgets import (
     QApplication, QDialog, QVBoxLayout, QLabel, QTextBrowser,
     QTreeWidget, QTreeWidgetItem, QPushButton, QSplitter, QDialogButtonBox, QHeaderView, QMessageBox,
@@ -10,10 +9,15 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QPixmap, QImage, QFont
 from PySide6.QtCore import Qt, Signal, QObject
 from Localization import tr
+import ImageCache
 
 class ImageLoader(QObject):
-    """Worker object to load an image in a separate thread."""
-    image_loaded = Signal(QPixmap)
+    """Worker object to load an image in a separate thread.
+
+    Carries a QImage, not a QPixmap: a QPixmap built on the worker thread is
+    undefined behaviour in Qt, so the conversion happens in the slot.
+    """
+    image_loaded = Signal(QImage)
     image_failed = Signal(str)
 
     def __init__(self, url):
@@ -21,8 +25,11 @@ class ImageLoader(QObject):
         self.url = url
 
     def run(self):
-        # This method will be executed in a separate thread
-        pass
+        try:
+            self.image_loaded.emit(ImageCache.fetch_image(self.url))
+        except Exception as e:
+            print(f"Failed to load image for dialog: {e}")
+            self.image_failed.emit(tr("fileselect.image_failed"))
 
 class FileSelectDialog(QDialog):
     def __init__(self, parent, item_data):
@@ -155,22 +162,15 @@ class FileSelectDialog(QDialog):
             self.image_loader.image_failed.connect(self.on_image_failed)
             
             # Run the image loading in a background thread
-            self.thread = threading.Thread(target=self._load_image_worker, daemon=True)
+            self.thread = threading.Thread(target=self.image_loader.run, daemon=True)
             self.thread.start()
 
         except Exception as e:
             print(f"Failed to load image: {e}")
             self.on_image_failed(tr("fileselect.image_failed"))
 
-    def _load_image_worker(self):
-        """Worker function to download and emit image data."""
-        response = requests.get(self.image_loader.url, timeout=10)
-        response.raise_for_status()
-        image = QImage()
-        image.loadFromData(response.content)
-        self.image_loader.image_loaded.emit(QPixmap.fromImage(image))
-
-    def on_image_loaded(self, pixmap):
+    def on_image_loaded(self, image):
+        pixmap = QPixmap.fromImage(image)
         self.image_label.setPixmap(pixmap.scaled(
             self.image_label.size(),
             Qt.KeepAspectRatio,

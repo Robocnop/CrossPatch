@@ -1,5 +1,6 @@
 import os
 import sys
+import hashlib
 import platform
 import shutil
 import shlex
@@ -16,6 +17,37 @@ from Constants import APP_VERSION
 from Config import is_packaged
 from Localization import tr
 import Util
+
+def is_installed_copy():
+    """True when this copy was installed by the Windows installer."""
+    if not is_packaged():
+        return False
+    # Inno Setup always leaves its uninstaller beside the application.
+    return os.path.isfile(os.path.join(os.path.dirname(sys.executable), "unins000.exe"))
+
+
+def verify_digest(path, expected):
+    """Raises if the file does not match GitHub's "sha256:<hex>" digest.
+
+    An empty expected value means the release carries no digest, which is
+    accepted: refusing would strand everyone on an older release.
+    """
+    if not expected:
+        print("The release asset carries no digest; skipping verification.")
+        return
+    algo, _, wanted = expected.partition(":")
+    if algo.lower() != "sha256" or not wanted:
+        print(f"Unknown digest format '{expected}'; skipping verification.")
+        return
+
+    sha = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            sha.update(chunk)
+    if sha.hexdigest().lower() != wanted.lower():
+        raise RuntimeError(tr("updater.digest_mismatch"))
+    print("Update archive matches the digest published by GitHub.")
+
 
 class UpdaterSignals(QObject):
     """Defines signals for communicating from the worker thread to the GUI."""
@@ -90,8 +122,15 @@ class Updater:
                 raise ValueError(tr("updater.no_asset"))
 
             download_url = asset['browser_download_url']
-            archive_path = os.path.join(self.temp_dir, asset['name'])
-            os.makedirs(self.temp_dir, exist_ok=True)
+            if asset['name'].lower().endswith('.exe'):
+                # Outside the install folder, which the installer rewrites.
+                archive_path = os.path.join(tempfile.mkdtemp(prefix='crosspatch-setup-'), asset['name'])
+            else:
+                archive_path = os.path.join(self.temp_dir, asset['name'])
+                os.makedirs(self.temp_dir, exist_ok=True)
+            # GitHub computes this itself for every uploaded asset. Older
+            # releases may predate it, in which case there is nothing to check.
+            self.expected_digest = asset.get('digest') or ""
 
             self.signals.request_download.emit(download_url, archive_path)
         except Exception as e:
@@ -101,6 +140,21 @@ class Updater:
         try:
             self.signals.label_text.emit(tr("updater.downloading", name=os.path.basename(archive_path)))
             self._download_file_with_progress(url, archive_path)
+            verify_digest(archive_path, getattr(self, "expected_digest", ""))
+
+            # Keep a copy of the settings: an update that goes wrong should
+            # never cost anyone their profiles.
+            try:
+                import Backup
+                Backup.auto_backup("before-update")
+            except Exception as e:
+                print(f"Could not back up the settings before updating: {e}")
+
+            if archive_path.lower().endswith('.exe'):
+                self.signals.label_text.emit(tr("updater.finalizing"))
+                self._run_installer(archive_path)
+                self.signals.finished.emit()
+                return
 
             extract_path = os.path.join(self.temp_dir, 'extracted')
             self._extract_archive(archive_path, extract_path, self.signals.label_text)
@@ -118,6 +172,16 @@ class Updater:
         if not available_assets:
             return None
 
+        # A copy set up by the installer is updated by the next installer: it
+        # may live in Program Files, where copying over the files would need
+        # rights the app does not have, and it keeps the uninstaller in sync.
+        if is_windows and is_installed_copy():
+            for asset in available_assets:
+                name = asset.get('name', '').lower()
+                if name.endswith('-setup.exe') and 'win' in name:
+                    return asset
+            print("No installer in this release; falling back to the zip.")
+
         for asset in available_assets:
             asset_name = asset.get('name', '').lower()
             if not asset_name.endswith('.zip'):
@@ -128,7 +192,7 @@ class Updater:
         return None
 
     def _download_file_with_progress(self, url, destination_path):
-        with requests.get(url, stream=True, headers={'User-Agent': f'CrossPatch-Updater/{APP_VERSION}'}) as r:
+        with requests.get(url, stream=True, headers={'User-Agent': f'CrossPatch-Updater/{APP_VERSION}'}, timeout=30) as r:
             r.raise_for_status()
             total_size = int(r.headers.get('content-length', 0))
             bytes_downloaded = 0
@@ -140,6 +204,19 @@ class Updater:
                         progress = (bytes_downloaded / total_size) * 100
                         self.signals.progress.emit(int(progress))
             self.signals.progress.emit(100)
+
+    def _run_installer(self, setup_path):
+        """Starts the downloaded installer, which waits for this app to exit.
+
+        /UPDATE=1 tells the setup script to wait on the CrossPatch.Running
+        mutex, install over the current copy and start CrossPatch again.
+        """
+        subprocess.Popen(
+            [setup_path, "/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/UPDATE=1"],
+            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+            close_fds=True,
+        )
+        time.sleep(1)
 
     def _run_updater_script(self, source_path):
         app_path = os.path.dirname(sys.executable) if is_packaged() else os.path.dirname(os.path.abspath(__file__))
